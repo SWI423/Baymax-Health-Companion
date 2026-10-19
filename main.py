@@ -1,21 +1,33 @@
-"""
-大白 - 主入口
-第一阶段：启动窗口，键盘控制表情。
-"""
 import pygame
 import sys
+import os
+import threading
 
-from output.face import (
-    init_face, get_screen, get_clock, update, draw,
-    blink, look_half, hold_half, hold_closed, open_eyes
-)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from config import WINDOW_WIDTH, WINDOW_HEIGHT
+from output import face
+from core.state_machine import BaymaxFSM, State
+from core import brain
 
+fsm = BaymaxFSM()
+
+def get_user_input_console():
+    print("\n" + "=" * 40)
+    print("👉 [大白已准备好倾听，请慢慢打字，回车发送]")
+    text = input("你：")
+    if text:
+        fsm.handle_event("USER_INPUT", payload=text)
+    print("=" * 40 + "\n")
+    fsm.pause_timeout = False
 
 def main():
-    init_face()
+    pygame.init()
+    screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
+    pygame.display.set_caption("大白 Baymax - 第一阶段")
 
-    screen = get_screen()
-    clock = get_clock()
+    face.init_face()
+    clock = pygame.time.Clock()
+    fsm.change_state(State.SLEEP)
 
     running = True
     while running:
@@ -24,37 +36,38 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_1:
-                    blink(80.0, 1)
-                    print("1 - 眨眼（快）")
-                elif event.key == pygame.K_2:
-                    hold_half(6.0)
-                    print("2 - 持续眯眼（慢眯）")
-                elif event.key == pygame.K_3:
-                    look_half(15.0, hold=1.0)
-                    print("3 - 眯一会（1秒）")
-                elif event.key == pygame.K_4:
-                    hold_closed(20.0)
-                    print("4 - 闭眼")
-                elif event.key == pygame.K_5:
-                    blink(100.0, 2)
-                    print("5 - 快眨眼 x2")
-                elif event.key == pygame.K_6:
-                    blink(15.0, 1)
-                    print("6 - 慢眨眼")
-                elif event.key == pygame.K_0:
-                    open_eyes(15.0)
-                    print("0 - 平滑恢复睁眼")
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                elif event.key == pygame.K_w or event.key == pygame.K_1:
+                    fsm.handle_event("WAKE_USER")
+                elif event.key == pygame.K_f:
+                    fsm.handle_event("WAKE_SENSOR" if fsm.state == State.SLEEP else "SENSOR_ALERT")
+                elif event.key == pygame.K_h:
+                    fsm.handle_event("WAKE_SENSOR" if fsm.state == State.SLEEP else "SENSOR_ALERT")
+                elif event.key == pygame.K_t:
+                    fsm.handle_event("WAKE_TIMER" if fsm.state == State.SLEEP else "TIMER_ALERT")
+                elif event.key == pygame.K_SPACE:
+                    if fsm.state not in [State.SLEEP, State.GREET]:
+                        fsm.pause_timeout = True
+                        threading.Thread(target=get_user_input_console, daemon=True).start()
 
-        update(dt)
-        draw()
+        pending_emotion = brain.get_pending_emotion()
+        if pending_emotion:
+            print(f"🎭 [主循环] 捕获到后台情绪: {pending_emotion}")
+            # 👈 如果状态机此时已经回到待机，立刻更新情绪并重置计时
+            fsm.set_emotion(pending_emotion)
+
+        fsm.update()
+
+        face.set_emotion(fsm.current_emotion)
+        face.update(dt)
+        face.draw()
+
         pygame.display.flip()
 
     pygame.quit()
     sys.exit()
-
 
 if __name__ == "__main__":
     main()
