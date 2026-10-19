@@ -1,0 +1,3 @@
+# requirements.txt —— 依赖清单（占位）：用到哪个就取消注释，然后 pip install -r requirements.txt
+# pygame
+# requests
