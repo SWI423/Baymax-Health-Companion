@@ -1,5 +1,5 @@
 """
-大白大脑 - LangChain 企业级架构版本
+大白大脑 - LangChain
 - Pass 1：基于 LCEL (LangChain Expression Language) 流式说话
 - Pass 2：保留原生 JSON 提取（为了极高的稳定性）
 - 保留：事件队列、智能分表、记忆系统、摘要系统
@@ -384,15 +384,19 @@ if __name__ == "__main__":
     memory.init_db()
     load_history()
     print("=== 大白大脑测试（LangChain 企业级架构） ===")
+    print("输入 '退出' 结束，'做摘要' 触发摘要\n")
+
     while True:
-        user_text = input("\n你：")
+        user_text = input("你：")
         if user_text == "退出":
             wait_pending_pass2()
+            print("大白：再见。")
             break
         if user_text == "做摘要":
             do_summary()
             continue
 
         print("大白：", end="", flush=True)
-        ask_baymax(user_text, on_chunk=lambda c: print(c, end="", flush=True))
+        ask_baymax(user_text, wait_pass2=False, on_chunk=lambda c: print(c, end="", flush=True))
         print()
+        wait_pending_pass2()
