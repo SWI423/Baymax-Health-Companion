@@ -3,6 +3,7 @@ import sys
 import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core import console
 from config import (
     FRAMES_PATH, FONT_PATH, WINDOW_WIDTH, WINDOW_HEIGHT, FACE_SIZE,
     FRAME_OPEN, FRAME_HALF, FRAME_CLOSED, MAX_FRAME, TOTAL_FRAMES
@@ -95,13 +96,21 @@ def open_eyes(speed=15.0):
     _mode = "return_to_open"
     _return_speed = speed
 
+# 演完后可以重新触发的瞬时表情：
+# LLM 思考要好几秒，concern 的 3 秒保持早在"精准覆盖"到来之前就播完了；
+# 若不支持重触发，覆盖同一情绪时会哑火（脸上毫无变化）。
+_RETRIGGER_EMOTIONS = {"concern", "serious"}
+
 def set_emotion(emotion_name):
     global _current_emotion, _auto_blink_timer, _next_blink_interval
     if _current_emotion == emotion_name:
-        return
+        # 同一情绪：瞬时表情在动画演完后应能再次触发（否则精准覆盖会哑火）；
+        # 动画播放中则不重启，否则主循环每帧调用会把动画无限摁在起点
+        if emotion_name not in _RETRIGGER_EMOTIONS or _mode != "idle":
+            return
 
     _current_emotion = emotion_name
-    print(f"[face] 切换情绪: {emotion_name}")
+    console.debug(f"切换情绪: {emotion_name}")
 
     if emotion_name == "sleepy":
         hold_closed(speed=20.0)

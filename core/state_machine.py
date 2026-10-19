@@ -5,6 +5,7 @@ import os
 import threading
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from core import console
 from core import brain
 
 class State(Enum):
@@ -32,7 +33,7 @@ class BaymaxFSM:
     def change_state(self, new_state):
         if self.state == new_state: return
         old_state = self.state
-        print(f"\n[FSM] 状态切换: {self.state.value} -> {new_state.value}")
+        console.debug(f"状态切换: {self.state.value} -> {new_state.value}")
         self.state = new_state
         self.state_enter_time = time.time()
 
@@ -98,7 +99,7 @@ class BaymaxFSM:
         # 👈 输入即刻预判：调用大模型之前，先按关键词把表情切到 concern
         quick_emotion = brain.predict_emotion_quick(user_text)
         if quick_emotion:
-            print(f"🎭 [即时预判] 关键词命中，表情提前切换: {quick_emotion}")
+            console.emotion(f"即时预判 → {quick_emotion}（关键词命中）")
             self.set_emotion(quick_emotion)
         def _chat_worker():
             print("\n大白：", end="", flush=True)
@@ -107,7 +108,7 @@ class BaymaxFSM:
             # 👈 异步精准覆盖：Pass 2 算出的真实情绪，立即覆盖之前的预判
             final_emotion = result.get("emotion")
             if final_emotion:
-                print(f"🎭 [精准覆盖] 应用 Pass 2 情绪: {final_emotion}")
+                console.emotion(f"精准覆盖 → {final_emotion}")
                 self.set_emotion(final_emotion)
             self.state_enter_time = 0 # 触发超时，回到待机
         threading.Thread(target=_chat_worker, daemon=True).start()
@@ -123,7 +124,7 @@ class BaymaxFSM:
         # 👈 核心逻辑：如果情绪保持了 3 秒以上，且当前处于待机状态，强制恢复 neutral
         if self.state == State.IDLE:
             if now - self.emotion_hold_timer > 3.0 and self.current_emotion != "neutral":
-                print("⏳ [FSM] 情绪保持结束，恢复平静待机。")
+                console.debug("情绪保持结束，恢复平静待机")
                 self.set_emotion("neutral")
             elif elapsed > 60:
                 self.handle_event("TIMEOUT_IDLE")

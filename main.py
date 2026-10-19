@@ -4,6 +4,7 @@ import os
 import threading
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from core import console
 from config import WINDOW_WIDTH, WINDOW_HEIGHT
 from output import face
 from core.state_machine import BaymaxFSM, State
@@ -12,12 +13,11 @@ from core import brain
 fsm = BaymaxFSM()
 
 def get_user_input_console():
-    print("\n" + "=" * 40)
-    print("👉 [大白已准备好倾听，请慢慢打字，回车发送]")
+    print("\n" + "─" * 46 + "\n💬 大白已准备好倾听，回车发送")
     text = input("你：")
     if text:
         fsm.handle_event("USER_INPUT", payload=text)
-    print("=" * 40 + "\n")
+    print("─" * 46)
     fsm.pause_timeout = False
 
 def main():
@@ -54,7 +54,8 @@ def main():
 
         pending_emotion = brain.get_pending_emotion()
         if pending_emotion:
-            print(f"🎭 [主循环] 捕获到后台情绪: {pending_emotion}")
+            # 异步通道兜底：正常情况下情绪已在聊天线程里精准落地
+            console.debug(f"主循环捕获到后台情绪: {pending_emotion}")
             # 👈 如果状态机此时已经回到待机，立刻更新情绪并重置计时
             fsm.set_emotion(pending_emotion)
 

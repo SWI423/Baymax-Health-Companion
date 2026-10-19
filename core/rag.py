@@ -8,6 +8,7 @@ import os
 import json
 import requests
 import numpy as np
+from core import console
 from core import memory
 
 # 将根目录加入路径，确保能导入 config
@@ -48,13 +49,14 @@ def get_embedding(text: str) -> np.ndarray:
         return np.array(embedding_list, dtype=np.float32)
 
     except Exception as e:
-        print(f"[RAG] 向量化失败：{e}")
+        console.error(f"向量化失败：{e}")
         return None
 
 
 def add_to_knowledge_base(text: str):
     """
-    把一条医疗知识写进 SQLite（带向量）
+    把一条医疗知识写进 SQLite（带向量）。
+    成功时静默（由调用方决定如何汇报），失败返回 False。
     """
     vec = get_embedding(text)
     if vec is None: return False
@@ -62,16 +64,15 @@ def add_to_knowledge_base(text: str):
     # 把 numpy 数组转成普通的 list，再转成 JSON 字符串存进数据库
     vec_str = json.dumps(vec.tolist())
     memory.save_rag_entry(text, vec_str)
-    print(f"[RAG] 成功录入知识库: {text[:20]}...")
     return True
 
 
-def search_knowledge_base(query: str, top_k=2):
+def search_knowledge_base(query: str, top_k=2, min_score=0.45):
     """
-    用户提问时，在知识库里搜索最相关的 top_k 条记录
+    用户提问时，在知识库里搜索最相关的 top_k 条记录。
+    相似度低于 min_score 的不注入——低分知识进 Prompt 只是噪音，还会把回复带偏。
+    终端只汇报命中条数和最高分，明细不打印。
     """
-    print(f"\n[RAG] 正在检索知识库，问题: {query}")
-
     # 1. 把用户的提问变成向量
     query_vec = get_embedding(query)
     if query_vec is None: return []
@@ -97,16 +98,18 @@ def search_knowledge_base(query: str, top_k=2):
         scored_entries.append((similarity, entry["content"]))
 
     if not scored_entries:
-        print("[RAG] 知识库中没有可用向量数据")
+        console.rag("知识库无可用向量数据")
         return []
 
-    # 4. 按照相似度从高到低排序，取前 top_k 个
+    # 4. 按照相似度从高到低排序，先过低分阈值，再取前 top_k 个
     scored_entries.sort(key=lambda x: x[0], reverse=True)
+    if not scored_entries or scored_entries[0][0] < min_score:
+        console.debug(f"知识库最高分 {scored_entries[0][0]:.2f}，未过 {min_score} 阈值，本次不注入")
+        return []
     results = scored_entries[:top_k]
 
-    # 打印检索结果（方便调试）
-    for score, text in results:
-        print(f"[RAG] 命中相似度 {score:.4f} -> {text}")
+    # 只汇报命中条数和最高分，保持终端干净
+    console.rag(f"知识库命中 {len(results)} 条 · 最高 {results[0][0]:.2f}")
 
     return [text for score, text in results]
 
@@ -116,14 +119,16 @@ if __name__ == "__main__":
     memory.init_db()
 
     # 1. 先录入几条医疗知识（快速冒烟测试；正式灌入请用 tools/init_rag_db.py）
-    print("--- 正在录入知识 ---")
-    add_to_knowledge_base("头晕时应立即坐下休息，避免摔倒。")
-    add_to_knowledge_base("眼睛酸痛可以使用温毛巾热敷缓解。")
-    add_to_knowledge_base("发烧超过38.5度建议服用退烧药并多喝水。")
-    add_to_knowledge_base("咳嗽时多喝温水，保持室内空气湿润。")
+    console.info("--- 正在录入知识 ---")
+    for t in ["头晕时应立即坐下休息，避免摔倒。",
+              "眼睛酸痛可以使用温毛巾热敷缓解。",
+              "发烧超过38.5度建议服用退烧药并多喝水。",
+              "咳嗽时多喝温水，保持室内空气湿润。"]:
+        if add_to_knowledge_base(t):
+            console.rag(f"已录入：{t}")
 
     # 2. 模拟用户提问检索
-    print("\n--- 开始检索 ---")
+    console.info("--- 开始检索 ---")
     # 问1：天旋地转，与“头晕”语义匹配
     search_knowledge_base("我刚刚站起来，感觉天旋地转的")
 

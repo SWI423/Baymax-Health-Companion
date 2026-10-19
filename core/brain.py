@@ -12,6 +12,7 @@ import json
 import queue
 import threading
 import requests
+from core import console
 from core import memory
 from core.rag import search_knowledge_base
 
@@ -179,7 +180,7 @@ def _fresh_messages():
 def load_history():
     global _messages
     _messages = _fresh_messages()
-    print("[brain] LangChain 版本启动，历史卫生模式已开启")
+    console.debug("LangChain 版本启动，历史卫生模式已开启")
 
 
 def _trim_messages():
@@ -226,11 +227,97 @@ def _extract_actions(user_input, reply):
     return {"emotion": emotion, "actions": actions}
 
 
+# ============================================================
+# Pass 2 记忆清洗：只放行"用户真说过"的内容
+# 事故背景：提取器曾把大白的反问/建议/安慰包装成"用户询问/用户提到"存进记忆库，
+# 污染语义检索。提示词负责教，这里负责拦——按子句做字面追溯，
+# 在用户原话里找不到依据的一律丢弃（宁可漏存，不可错存）。
+# ============================================================
+_PUNCT_RE = re.compile(r"[，。！？、,.!?\s\u3000；;\"'“”‘’]")
+# 记忆句式的模板前缀（追溯判定时剥掉，存储时保留）
+_PREFIX_RE = re.compile(r"^(用户)?(表示|提到|询问|反映|认为|说明|声称|感觉)?")
+
+def _bigrams(s):
+    """文本的二字组集合（剥掉标点后计算，跨标点拼接）"""
+    s = _PUNCT_RE.sub("", str(s))
+    if len(s) < 2:
+        return {s} if s else set()
+    return {s[i:i + 2] for i in range(len(s) - 1)}
+
+def _trace_score(content, text):
+    """content 的二字组有多大比例能在 text 中找到（0~1）"""
+    bg = _bigrams(_PREFIX_RE.sub("", str(content)))
+    if not bg:
+        return 0.0
+    return len(bg & _bigrams(text)) / len(bg)
+
+def _sanitize_memory_content(content, user_input):
+    """
+    清洗一条 SAVE_MEMORY 内容：
+    - 按标点拆子句，逐句验证能否在用户原话里找到字面依据
+    - 找不到依据的子句丢弃（几乎全是大白的话或模型的引申）
+    - 所有子句都无依据 → 返回 None（整条丢弃）
+    """
+    content = str(content).strip().rstrip("。")
+    if not content:
+        return None
+    clauses = [c.strip() for c in re.split(r"[，,；;。]", content) if c.strip()]
+    if len(clauses) <= 1:
+        return content if _trace_score(content, user_input) >= 0.2 else None
+    kept = [c for c in clauses if _trace_score(c, user_input) >= 0.2]
+    return "，".join(kept) if kept else None
+
+def _sanitize_memory_actions(actions, user_input, reply):
+    """
+    对 Pass 2 提取出的动作做入库前清洗，返回清洗后的 actions：
+    1. 用户原话里毫无字面依据 → 丢弃（大白的话或幻觉）
+    2. 逐子句剥离无依据部分（模型的引申在这里被切掉）
+    3. 批次内去重 + 与最近 30 条已有记忆去重
+    注：不按【大白的回复】追溯——回复本来就会复述用户的事实
+    （如"找实习和准备软考确实耗费精力"），按它判定会误杀真记忆。
+    """
+    existing = memory.get_memory_points_for_prompt(limit=30)
+    existing_bg = [_bigrams(p) for p in existing]
+    seen = set()
+    cleaned = []
+    for a in actions:
+        if not isinstance(a, dict):
+            continue
+        if str(a.get("type", "")).upper() != "SAVE_MEMORY":
+            cleaned.append(a)
+            continue
+        raw = a.get("content")
+        if not raw:
+            continue
+        if _trace_score(raw, user_input) < 0.1:
+            console.debug(f"[过滤] 用户原话中无依据：{raw}")
+            continue
+        content = _sanitize_memory_content(raw, user_input)
+        if not content:
+            console.debug(f"[过滤] 各子句均无依据：{raw}")
+            continue
+        key = _PUNCT_RE.sub("", content)
+        if key in seen:
+            continue
+        seen.add(key)
+        bg = _bigrams(content)
+        if any(len(bg & e) / max(1, len(bg | e)) >= 0.6 for e in existing_bg):
+            console.debug(f"[过滤] 与已有记忆重复：{content}")
+            continue
+        cleaned.append({"type": "SAVE_MEMORY", "content": content})
+    return cleaned
+
+
 def _pass2_worker(user_input, reply):
     extracted = _extract_actions(user_input, reply)
-    if extracted["actions"]: _execute_actions(extracted["actions"])
+    # 👈 入库前清洗：拦掉大白的话、模型的引申和重复记忆
+    extracted["actions"] = _sanitize_memory_actions(extracted["actions"], user_input, reply)
+    if extracted["actions"]:
+        _execute_actions(extracted["actions"])
+        console.action(f"后台执行 {len(extracted['actions'])} 项操作")
     emotion_queue.put(extracted["emotion"])
-    print(f"[pass2] emotion={extracted['emotion']}，actions={len(extracted['actions'])}")
+    # 情绪由状态机层汇报，这里只留调试明细
+    console.debug(f"pass2 emotion={extracted['emotion']}")
 
 
 # ============================================================
@@ -273,6 +360,8 @@ def ask_baymax(user_input, wait_pass2=False, on_chunk=None):
     _PASS2_THREADS.append(t)
 
     if wait_pass2:
+        if on_chunk:
+            print()  # 收尾流式回复，避免后台日志粘在回复行尾
         t.join()
         emotion = "neutral"
         while not emotion_queue.empty():
@@ -305,7 +394,7 @@ def _execute_actions(actions):
             elif atype == "SAVE_MEMORY":
                 if a.get("content"): _save_memory_from_content(a["content"])
         except Exception as e:
-            print(f"[action] 失败：{e}")
+            console.error(f"后台动作失败：{e}")
 
 
 def _normalize_time(t):
@@ -342,9 +431,9 @@ def _save_memory_from_content(content):
 
     if not saved:
         memory.save_memory_point(content, source="user_command", importance=8)
-        print(f"[action] → memory_points: {content}")
+        console.action(f"已记住：{content}")
     else:
-        print(f"[action] → user_profile 已更新")
+        console.action("用户资料已更新")
 
 
 def wait_pending_pass2():

@@ -18,6 +18,8 @@ from datetime import datetime, date
 
 import numpy as np
 
+from core import console
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import DATABASE_PATH
 
@@ -117,7 +119,7 @@ def init_db():
 
     conn.commit()
     conn.close()
-    print("[memory] 数据库初始化完成，7 张表已就绪") # 修改为7张表
+    console.debug("数据库初始化完成，7 张表已就绪")
 
 
 def _migrate_embedding_columns(cursor=None):
@@ -138,7 +140,7 @@ def _migrate_embedding_columns(cursor=None):
         cols = [row[1] for row in c.fetchall()]
         if "embedding" not in cols:
             c.execute(f"ALTER TABLE {table} ADD COLUMN embedding TEXT")
-            print(f"[memory] 检测到旧版 {table} 表，已自动补充 embedding 字段（旧数据保留）")
+            console.info(f"{table} 表已自动补充 embedding 字段（旧数据保留）")
 
     if own_conn:
         conn.commit()
@@ -175,7 +177,7 @@ def update_user_profile(user_id="default", **fields):
     c.execute(f"UPDATE user_profile SET {set_clause}, updated_at = ? WHERE user_id = ?", values)
     conn.commit()
     conn.close()
-    print(f"[memory] 更新用户信息：{updates}")
+    console.info(f"用户信息已更新：{'、'.join(updates.keys())}")
 
 
 def get_user_profile(user_id="default"):
@@ -205,7 +207,7 @@ def save_memory_point(content, source="user_command", importance=5):
         if vec is not None:
             embedding_str = json.dumps(vec.tolist())
     except Exception as e:
-        print(f"[memory] 记忆点向量化失败（内容仍会保存）：{e}")
+        console.warn(f"记忆点向量化失败（内容仍会保存）：{e}")
 
     conn = _get_conn()
     c = conn.cursor()
@@ -233,6 +235,19 @@ def get_memory_points_for_prompt(limit=10):
     rows = c.fetchall()
     conn.close()
     return [r[0] for r in rows]
+
+
+def delete_memory_points(ids):
+    """按 ID 批量删除记忆点（清理错误提取的垃圾记忆），返回实际删除条数"""
+    if not ids:
+        return 0
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute(f"DELETE FROM memory_points WHERE id IN ({','.join('?' * len(ids))})", list(ids))
+    deleted = c.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
 
 
 # ============================================================
@@ -282,7 +297,7 @@ def delete_summarized_chats(chat_ids):
     c.execute(f"DELETE FROM chat_short WHERE id IN ({ph})", chat_ids)
     conn.commit()
     conn.close()
-    print(f"[memory] 已删除 {len(chat_ids)} 条已总结的对话")
+    console.debug(f"已删除 {len(chat_ids)} 条已总结的对话")
 
 
 # ============================================================
@@ -298,7 +313,7 @@ def save_chat_summary(period_start, period_end, summary):
         if vec is not None:
             embedding_str = json.dumps(vec.tolist())
     except Exception as e:
-        print(f"[memory] 摘要向量化失败（内容仍会保存）：{e}")
+        console.warn(f"摘要向量化失败（内容仍会保存）：{e}")
 
     conn = _get_conn()
     c = conn.cursor()
@@ -460,7 +475,7 @@ def search_long_term_memory_by_vector(query, limit=3, threshold=0.5):
 
     query_vec = get_embedding(query)
     if query_vec is None:
-        print("[memory] 提问向量化失败，本次跳过语义记忆检索")
+        console.warn("提问向量化失败，本次跳过语义记忆检索")
         return []
 
     conn = _get_conn()
@@ -494,10 +509,10 @@ def search_long_term_memory_by_vector(query, limit=3, threshold=0.5):
     results = scored[:limit]
 
     if results:
-        for r in results:
-            print(f"[memory] 语义记忆命中 {r['score']:.4f} [{r['source']}] {r['content'][:40]}")
+        # 只汇报命中条数和最高分，明细不打印
+        console.mem(f"语义命中 {len(results)} 条 · 最高 {results[0]['score']:.2f}")
     else:
-        print("[memory] 语义记忆未命中（相似度均未超过阈值）")
+        console.mem("语义记忆未命中")
     return results
 
 
@@ -521,7 +536,7 @@ def backfill_embeddings():
             filled += 1
     conn.commit()
     conn.close()
-    print(f"[memory] 向量补填完成，共更新 {filled} 条历史记录")
+    console.info(f"向量补填完成，共更新 {filled} 条历史记录")
     return filled
 
 
@@ -566,7 +581,7 @@ def clear_rag_entries():
     c.execute("DELETE FROM rag_knowledge")
     conn.commit()
     conn.close()
-    print("[memory] 知识库已清空")
+    console.info("知识库已清空")
 
 
 if __name__ == "__main__":

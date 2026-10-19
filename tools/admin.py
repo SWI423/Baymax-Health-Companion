@@ -128,4 +128,19 @@ def show_all():
 
 if __name__ == "__main__":
     memory.init_db()
-    show_all()
+    # 清理错误提取的记忆点：python tools/admin.py --purge-memory-ids 5,6,7
+    if "--purge-memory-ids" in sys.argv:
+        try:
+            raw_ids = sys.argv[sys.argv.index("--purge-memory-ids") + 1]
+            ids = [int(x) for x in raw_ids.split(",") if x.strip()]
+        except (IndexError, ValueError):
+            print("用法：python tools/admin.py --purge-memory-ids 5,6,7")
+            sys.exit(1)
+        points = {p["id"]: p["content"] for p in memory.get_all_memory_points()}
+        print("即将删除以下记忆点：")
+        for i in ids:
+            print(f"  [{i}] {points.get(i, '（ID 不存在）')}")
+        n = memory.delete_memory_points(ids)
+        print(f"已删除 {n} 条记忆点")
+    else:
+        show_all()
