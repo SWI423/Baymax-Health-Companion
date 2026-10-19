@@ -115,7 +115,8 @@ def set_emotion(emotion_name):
         blink(speed=100.0, count=2)
         _next_blink_interval = 1.0
     elif emotion_name == "serious":
-        look_half(speed=6.0, hold=3.0)
+        # 👈 沉重地半眯眼，保持 3 秒后自动平滑睁开
+        look_half(speed=5.0, hold=3.0)
     elif emotion_name == "neutral":
         open_eyes(speed=15.0)
         _next_blink_interval = 3.0

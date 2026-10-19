@@ -16,7 +16,7 @@ from core import memory
 from core.rag import search_knowledge_base
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import API_KEY, API_URL, MODEL_NAME, LANGUAGE, Keywords
+from config import API_KEY, API_URL, MODEL_NAME, LANGUAGE, Keywords, QUICK_CONCERN_KEYWORDS
 from prompts import (SYSTEM_PROMPT, EXTRACT_PROMPT,
                      SUMMARY_PROMPT_USER, SUMMARY_PROMPT_MEMORY, SUMMARY_PROMPT_LONG,
                      FEWSHOT_EXAMPLES)
@@ -55,6 +55,19 @@ VALID_EMOTIONS = {"neutral", "concern", "alert", "serious", "suspect", "sleepy"}
 emotion_queue = queue.Queue()
 
 
+def predict_emotion_quick(user_input):
+    """
+    输入即刻预判：在调用大模型之前，根据关键词立即给出情绪标签。
+    随后 Pass 2 提取到的精准情绪会覆盖它（见 state_machine.handle_chat）。
+    """
+    if not user_input:
+        return None
+    for kw in QUICK_CONCERN_KEYWORDS:
+        if kw in user_input:
+            return "concern"
+    return None
+
+
 # ============================================================
 # 构建提示词与上下文
 # ============================================================
@@ -68,7 +81,7 @@ def _build_persona_prompt():
     prompt += f"""
 
 【记忆规则】
-用户问"你记得我什么""你记得我喜欢…吗"时，直接从资料层陈述你记得的内容，不要说"已记录"——"已记录"只用于确认新信息已存档。只能从【用户信息】【记忆点】【往日摘要】读取，不要从【相关历史】推断。
+用户问"你记得我什么""你记得我喜欢…吗"时，直接从资料层陈述你记得的内容，不要说"已记录"——"已记录"只用于确认新信息已存档。只能从【用户信息】【记忆点】【往日摘要】读取，不要从【相关历史与记忆】推断。
 
 【输出语言】
 {lang_note}
@@ -113,10 +126,20 @@ def _build_data_context(user_input=None):
         sections.append(text.rstrip())
 
     if user_input:
-        related = memory.search_all_for_rag(user_input, limit=3)
-        if related:
-            text = "【相关历史】\n"
-            for r in related: text += f"- [{r['source']}] {r['content']}\n"
+        # 混合检索：短期原话（chat_short 最近几句）+ 长期语义记忆（向量余弦相似度）
+        recent_chats = memory.get_recent_chats(limit=3)
+        related_memories = memory.search_long_term_memory_by_vector(user_input, limit=3)
+        if recent_chats or related_memories:
+            text = "【相关历史与记忆】\n"
+            if recent_chats:
+                text += "近期对话原话：\n"
+                for c in recent_chats:
+                    speaker = "用户" if c["role"] == "user" else "大白"
+                    text += f"- {speaker}: {c['content']}\n"
+            if related_memories:
+                text += "深层语义记忆（向量检索）：\n"
+                for m in related_memories:
+                    text += f"- [{m['source']}] {m['content']}\n"
             sections.append(text.rstrip())
 
         medical_knowledge = search_knowledge_base(user_input, top_k=2)

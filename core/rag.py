@@ -1,6 +1,7 @@
 """
 RAG 检索增强生成模块
-第一步：实现文本向量化（Embedding）
+基于智谱 embedding-3 的文本向量化 + 余弦相似度检索。
+知识库批量灌入/去重重灌请运行：python tools/init_rag_db.py
 """
 import sys
 import os
@@ -21,7 +22,7 @@ EMBEDDING_MODEL = "embedding-3"
 
 def get_embedding(text: str) -> np.ndarray:
     """
-    将一段文本转换为 1024 维的数学向量
+    将一段文本转换为数学向量（智谱 embedding-3，默认 2048 维）
     """
     headers = {
         "Authorization": f"Bearer {API_KEY}",
@@ -82,12 +83,22 @@ def search_knowledge_base(query: str, top_k=2):
     # 3. 挨个算相似度
     scored_entries = []
     for entry in entries:
-        # 把数据库里的字符串反解成 numpy 数组
-        db_vec = np.array(json.loads(entry["embedding"]), dtype=np.float32)
+        emb_str = entry.get("embedding")
+        if not emb_str:
+            continue  # 跳过没有向量的历史数据
+        try:
+            # 把数据库里的字符串反解成 numpy 数组
+            db_vec = np.array(json.loads(emb_str), dtype=np.float32)
+        except Exception:
+            continue  # 跳过损坏的向量数据
 
         # 算余弦相似度
         similarity = np.dot(query_vec, db_vec) / (np.linalg.norm(query_vec) * np.linalg.norm(db_vec))
         scored_entries.append((similarity, entry["content"]))
+
+    if not scored_entries:
+        print("[RAG] 知识库中没有可用向量数据")
+        return []
 
     # 4. 按照相似度从高到低排序，取前 top_k 个
     scored_entries.sort(key=lambda x: x[0], reverse=True)
@@ -104,7 +115,7 @@ if __name__ == "__main__":
     # 初始化数据库表
     memory.init_db()
 
-    # 1. 先录入几条医疗知识（模拟医疗知识库）
+    # 1. 先录入几条医疗知识（快速冒烟测试；正式灌入请用 tools/init_rag_db.py）
     print("--- 正在录入知识 ---")
     add_to_knowledge_base("头晕时应立即坐下休息，避免摔倒。")
     add_to_knowledge_base("眼睛酸痛可以使用温毛巾热敷缓解。")

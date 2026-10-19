@@ -11,3 +11,5 @@ __pycache__/
 # 忽略虚拟环境
 .venv/
 venv/
+# 忽略本地源码备份目录
+_backup_*/

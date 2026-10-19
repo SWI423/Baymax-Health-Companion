@@ -95,10 +95,20 @@ class BaymaxFSM:
 
     def handle_chat(self, user_text):
         if not user_text: return
+        # 👈 输入即刻预判：调用大模型之前，先按关键词把表情切到 concern
+        quick_emotion = brain.predict_emotion_quick(user_text)
+        if quick_emotion:
+            print(f"🎭 [即时预判] 关键词命中，表情提前切换: {quick_emotion}")
+            self.set_emotion(quick_emotion)
         def _chat_worker():
             print("\n大白：", end="", flush=True)
-            brain.ask_baymax(user_text, wait_pass2=True, on_chunk=lambda c: print(c, end="", flush=True))
+            result = brain.ask_baymax(user_text, wait_pass2=True, on_chunk=lambda c: print(c, end="", flush=True))
             print()
+            # 👈 异步精准覆盖：Pass 2 算出的真实情绪，立即覆盖之前的预判
+            final_emotion = result.get("emotion")
+            if final_emotion:
+                print(f"🎭 [精准覆盖] 应用 Pass 2 情绪: {final_emotion}")
+                self.set_emotion(final_emotion)
             self.state_enter_time = 0 # 触发超时，回到待机
         threading.Thread(target=_chat_worker, daemon=True).start()
 

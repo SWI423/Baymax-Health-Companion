@@ -1,3 +1,7 @@
-# requirements.txt —— 依赖清单（占位）：用到哪个就取消注释，然后 pip install -r requirements.txt
-# pygame
-# requests
+# requirements.txt —— 依赖清单
+# RAG 向量化 / 智谱 API / LangChain 流式对话 / pygame 表情窗口
+pygame
+requests
+numpy
+langchain-openai
+langchain-core
