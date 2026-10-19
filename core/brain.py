@@ -13,6 +13,8 @@ import json
 import queue
 import threading
 import requests
+from core import memory
+from core.rag import search_knowledge_base  # <--- 新增这一行
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import API_KEY, API_URL, MODEL_NAME, LANGUAGE, Keywords
@@ -94,11 +96,20 @@ def _build_data_context(user_input=None):
         sections.append(text.rstrip())
 
     if user_input:
+        # 1. 检索关于用户的聊天历史（关键词）
         related = memory.search_all_for_rag(user_input, limit=3)
         if related:
             text = "【相关历史】\n"
             for r in related:
                 text += f"- [{r['source']}] {r['content']}\n"
+            sections.append(text.rstrip())
+
+        # 👇 新增：2. 检索本地医疗知识库（向量检索）
+        medical_knowledge = search_knowledge_base(user_input, top_k=2)
+        if medical_knowledge:
+            text = "【参考医疗知识】\n"
+            for k in medical_knowledge:
+                text += f"- {k}\n"
             sections.append(text.rstrip())
 
     if not sections:

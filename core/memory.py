@@ -1,9 +1,10 @@
 """
-大白记忆系统 - 6 张表，分三层记忆架构。
+大白记忆系统 - 7 张表，分三层记忆架构。
 
 语义记忆：user_profile、memory_points、health_log
 情景记忆：chat_short、chat_long
 工作记忆：reminders
+RAG扩展：rag_knowledge
 """
 
 import sqlite3
@@ -24,7 +25,7 @@ def init_db():
     conn = _get_conn()
     c = conn.cursor()
 
-    # 表1：用户信息（单行，家人信息存 memory_points）
+    # 表1：用户信息
     c.execute("""
         CREATE TABLE IF NOT EXISTS user_profile (
             user_id     TEXT PRIMARY KEY,
@@ -93,9 +94,19 @@ def init_db():
         )
     """)
 
+    # 表7：RAG 医疗知识库 (必须放在 commit 之前)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS rag_knowledge (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            content     TEXT,
+            embedding   TEXT,
+            created_at  TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
-    print("[memory] 数据库初始化完成，6 张表已就绪")
+    print("[memory] 数据库初始化完成，7 张表已就绪") # 修改为7张表
 
 
 # ============================================================
@@ -116,7 +127,6 @@ def _ensure_user(user_id="default"):
 
 
 def update_user_profile(user_id="default", **fields):
-    """更新用户信息。字段：name / age / birthday / sibling"""
     _ensure_user(user_id)
     allowed = {"name", "age", "birthday", "sibling"}
     updates = {k: v for k, v in fields.items() if k in allowed and v is not None}
@@ -142,12 +152,8 @@ def get_user_profile(user_id="default"):
     """, (user_id,))
     row = c.fetchone()
     conn.close()
-    if not row:
-        return {}
-    return {
-        "user_id": row[0], "name": row[1], "age": row[2],
-        "birthday": row[3], "health_id": row[4], "sibling": row[5]
-    }
+    if not row: return {}
+    return {"user_id": row[0], "name": row[1], "age": row[2], "birthday": row[3], "health_id": row[4], "sibling": row[5]}
 
 
 # ============================================================
@@ -167,24 +173,16 @@ def save_memory_point(content, source="user_command", importance=5):
 def get_all_memory_points():
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT id, content, source, importance, created_at
-        FROM memory_points ORDER BY importance DESC, id ASC
-    """)
+    c.execute("SELECT id, content, source, importance, created_at FROM memory_points ORDER BY importance DESC, id ASC")
     rows = c.fetchall()
     conn.close()
-    return [{"id": r[0], "content": r[1], "source": r[2],
-             "importance": r[3], "created_at": r[4]} for r in rows]
+    return [{"id": r[0], "content": r[1], "source": r[2], "importance": r[3], "created_at": r[4]} for r in rows]
 
 
 def get_memory_points_for_prompt(limit=10):
-    """按重要性取前 N 条记忆点，用于注入提示词。"""
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT content FROM memory_points
-        ORDER BY importance DESC, id DESC LIMIT ?
-    """, (limit,))
+    c.execute("SELECT content FROM memory_points ORDER BY importance DESC, id DESC LIMIT ?", (limit,))
     rows = c.fetchall()
     conn.close()
     return [r[0] for r in rows]
@@ -196,10 +194,7 @@ def get_memory_points_for_prompt(limit=10):
 def save_chat(role, content):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO chat_short (role, content, timestamp)
-        VALUES (?, ?, ?)
-    """, (role, content, datetime.now().isoformat()))
+    c.execute("INSERT INTO chat_short (role, content, timestamp) VALUES (?, ?, ?)", (role, content, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -207,10 +202,7 @@ def save_chat(role, content):
 def get_recent_chats(limit=20):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT role, content FROM chat_short
-        ORDER BY id DESC LIMIT ?
-    """, (limit,))
+    c.execute("SELECT role, content FROM chat_short ORDER BY id DESC LIMIT ?", (limit,))
     rows = c.fetchall()
     conn.close()
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
@@ -219,10 +211,7 @@ def get_recent_chats(limit=20):
 def get_unsummarized_chats():
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT id, role, content, timestamp FROM chat_short
-        WHERE summarized = 0 ORDER BY id ASC
-    """)
+    c.execute("SELECT id, role, content, timestamp FROM chat_short WHERE summarized = 0 ORDER BY id ASC")
     rows = c.fetchall()
     conn.close()
     return [{"id": r[0], "role": r[1], "content": r[2], "timestamp": r[3]} for r in rows]
@@ -255,10 +244,8 @@ def delete_summarized_chats(chat_ids):
 def save_chat_summary(period_start, period_end, summary):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO chat_long (period_start, period_end, summary, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (period_start, period_end, summary, datetime.now().isoformat()))
+    c.execute("INSERT INTO chat_long (period_start, period_end, summary, created_at) VALUES (?, ?, ?, ?)",
+              (period_start, period_end, summary, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -266,10 +253,7 @@ def save_chat_summary(period_start, period_end, summary):
 def get_recent_summaries(limit=5):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT period_start, period_end, summary FROM chat_long
-        ORDER BY id DESC LIMIT ?
-    """, (limit,))
+    c.execute("SELECT period_start, period_end, summary FROM chat_long ORDER BY id DESC LIMIT ?", (limit,))
     rows = c.fetchall()
     conn.close()
     return [{"period_start": r[0], "period_end": r[1], "summary": r[2]} for r in rows]
@@ -281,10 +265,7 @@ def get_recent_summaries(limit=5):
 def save_health_event(event_type, detail=""):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        INSERT INTO health_log (event_type, detail, timestamp)
-        VALUES (?, ?, ?)
-    """, (event_type, detail, datetime.now().isoformat()))
+    c.execute("INSERT INTO health_log (event_type, detail, timestamp) VALUES (?, ?, ?)", (event_type, detail, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -292,10 +273,7 @@ def save_health_event(event_type, detail=""):
 def get_recent_health_events(limit=5):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT event_type, detail, timestamp FROM health_log
-        ORDER BY id DESC LIMIT ?
-    """, (limit,))
+    c.execute("SELECT event_type, detail, timestamp FROM health_log ORDER BY id DESC LIMIT ?", (limit,))
     rows = c.fetchall()
     conn.close()
     return [{"event_type": r[0], "detail": r[1], "timestamp": r[2]} for r in rows]
@@ -309,13 +287,10 @@ def save_reminder(event_name, time_str, frequency="daily"):
     conn = _get_conn()
     c = conn.cursor()
     if existing and existing["status"] == "active":
-        c.execute("UPDATE reminders SET time = ?, frequency = ?, status = 'active' WHERE event_name = ?",
-                  (time_str, frequency, event_name))
+        c.execute("UPDATE reminders SET time = ?, frequency = ?, status = 'active' WHERE event_name = ?", (time_str, frequency, event_name))
     else:
-        c.execute("""
-            INSERT INTO reminders (event_name, time, frequency, status, created_at)
-            VALUES (?, ?, ?, 'active', ?)
-        """, (event_name, time_str, frequency, datetime.now().isoformat()))
+        c.execute("INSERT INTO reminders (event_name, time, frequency, status, created_at) VALUES (?, ?, ?, 'active', ?)",
+                  (event_name, time_str, frequency, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -323,15 +298,11 @@ def save_reminder(event_name, time_str, frequency="daily"):
 def get_reminder(event_name):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("""
-        SELECT id, event_name, time, frequency, status, last_triggered, created_at
-        FROM reminders WHERE event_name = ?
-    """, (event_name,))
+    c.execute("SELECT id, event_name, time, frequency, status, last_triggered, created_at FROM reminders WHERE event_name = ?", (event_name,))
     row = c.fetchone()
     conn.close()
     if not row: return None
-    return {"id": row[0], "event_name": row[1], "time": row[2], "frequency": row[3],
-            "status": row[4], "last_triggered": row[5], "created_at": row[6]}
+    return {"id": row[0], "event_name": row[1], "time": row[2], "frequency": row[3], "status": row[4], "last_triggered": row[5], "created_at": row[6]}
 
 
 def get_all_reminders(only_active=False):
@@ -343,8 +314,7 @@ def get_all_reminders(only_active=False):
         c.execute("SELECT id, event_name, time, frequency, status, last_triggered, created_at FROM reminders ORDER BY time ASC")
     rows = c.fetchall()
     conn.close()
-    return [{"id": r[0], "event_name": r[1], "time": r[2], "frequency": r[3],
-             "status": r[4], "last_triggered": r[5], "created_at": r[6]} for r in rows]
+    return [{"id": r[0], "event_name": r[1], "time": r[2], "frequency": r[3], "status": r[4], "last_triggered": r[5], "created_at": r[6]} for r in rows]
 
 
 def update_reminder(event_name, new_time=None, new_frequency=None):
@@ -369,8 +339,7 @@ def cancel_reminder(event_name):
 def mark_reminder_triggered(event_name):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("UPDATE reminders SET last_triggered = ? WHERE event_name = ?",
-              (datetime.now().isoformat(), event_name))
+    c.execute("UPDATE reminders SET last_triggered = ? WHERE event_name = ?", (datetime.now().isoformat(), event_name))
     conn.commit()
     conn.close()
 
@@ -388,35 +357,22 @@ def get_missed_reminders():
 
 
 # ============================================================
-# RAG：三表联合检索
+# 关键词检索 (旧的伪RAG，保留作为备用)
 # ============================================================
 def search_all_for_rag(keyword, limit=3):
-    """
-    从 chat_short、chat_long、memory_points 三表检索相关单元。
-    返回：[{"source": "short"/"long"/"memory", "content": "..."}]
-    """
     results = []
     conn = _get_conn()
     c = conn.cursor()
 
-    c.execute("""
-        SELECT role, content FROM chat_short
-        WHERE content LIKE ? ORDER BY id DESC LIMIT ?
-    """, (f"%{keyword}%", limit))
+    c.execute("SELECT role, content FROM chat_short WHERE content LIKE ? ORDER BY id DESC LIMIT ?", (f"%{keyword}%", limit))
     for role, content in c.fetchall():
         results.append({"source": "short", "content": f"{role}: {content}"})
 
-    c.execute("""
-        SELECT summary FROM chat_long
-        WHERE summary LIKE ? ORDER BY id DESC LIMIT ?
-    """, (f"%{keyword}%", limit))
+    c.execute("SELECT summary FROM chat_long WHERE summary LIKE ? ORDER BY id DESC LIMIT ?", (f"%{keyword}%", limit))
     for (s,) in c.fetchall():
         results.append({"source": "long", "content": s})
 
-    c.execute("""
-        SELECT content FROM memory_points
-        WHERE content LIKE ? ORDER BY importance DESC LIMIT ?
-    """, (f"%{keyword}%", limit))
+    c.execute("SELECT content FROM memory_points WHERE content LIKE ? ORDER BY importance DESC LIMIT ?", (f"%{keyword}%", limit))
     for (s,) in c.fetchall():
         results.append({"source": "memory", "content": s})
 
@@ -433,7 +389,32 @@ def count_unsummarized_chats():
     return count
 
 
+# ============================================================
+# 表7：RAG 知识库读写 (新加入)
+# ============================================================
+def save_rag_entry(content, embedding_str):
+    """保存一条知识库记录及其向量"""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO rag_knowledge (content, embedding, created_at)
+        VALUES (?, ?, ?)
+    """, (content, embedding_str, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def get_all_rag_entries():
+    """读取知识库所有记录（用于计算相似度）"""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("SELECT id, content, embedding FROM rag_knowledge")
+    rows = c.fetchall()
+    conn.close()
+    return [{"id": r[0], "content": r[1], "embedding": r[2]} for r in rows]
+
+
 if __name__ == "__main__":
     init_db()
     print("用户信息：", get_user_profile())
-    print("记忆点：", get_memory_points_for_prompt())
+    print("记忆点数量：", len(get_all_memory_points()))
