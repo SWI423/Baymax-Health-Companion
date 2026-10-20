@@ -35,7 +35,9 @@ llm = ChatOpenAI(
     api_key=API_KEY,
     base_url="https://open.bigmodel.cn/api/paas/v4/",
     model=MODEL_NAME,
-    temperature=0.9,
+    # temperature 0.7：高温度会放大模型"热情助人+格式化输出"的先验（编号清单泛滥），
+    # 降温提升指令遵循；诙谐由人设与 few-shot 示范保证，不依赖随机性
+    temperature=0.7,
     streaming=True
 )
 
@@ -183,10 +185,18 @@ def load_history():
     console.debug("LangChain 版本启动，历史卫生模式已开启")
 
 
+# 模块装载即注入 few-shot：运行链（main→state_machine→ask_baymax）不经过 __main__，
+# 历史上 few-shot 从未生效，导致反导师腔/换框等行为缺少正向示范兜底
+load_history()
+
+
 def _trim_messages():
     global _messages
     if len(_messages) > MAX_MESSAGES:
-        _messages = _messages[-(MAX_MESSAGES):]
+        # 保护队首 few-shot（行为示范），只裁剪中间的历史对话
+        head = _messages[:_FIXED_HEAD]
+        tail = _messages[-(MAX_MESSAGES - _FIXED_HEAD):]
+        _messages = head + tail
 
 
 # ============================================================
@@ -334,6 +344,44 @@ def _pass2_worker(user_input, reply):
 
 
 # ============================================================
+# 格式守卫：导师腔的最后一道防线（代码层，确定性）
+# 背景：GLM 对"该怎么办/有什么建议"类输入有极强的编号清单先验，
+# prompt 层（顶部禁令+示范+降温）能压大部分但压不死。这里做确定性兜底：
+# 流式回复完成后检测，命中格式违规 → 带修正指令重写一次（非流式）；
+# 重写版仍违规则保留原版（不无限重试）。违规模不写进对话历史。
+# ============================================================
+_FORMAT_VIOLATION_PATTERNS = [
+    (re.compile(r"(?m)^\s*\d+\s*[.、）)]\s*\S"), "编号列表"),
+    (re.compile(r"(?m)^\s*[-*•]\s+\S"), "项目符号列表"),
+    (re.compile(r"第[一二三四五六七八九十]步"), "步骤编排"),
+    (re.compile(r"以下[是有几][^\n。]{0,8}(建议|方法|步骤)"), "清单导语"),
+]
+
+def _find_format_violation(text):
+    """返回第一个命中的违规类型名，无违规返回 None"""
+    for rx, name in _FORMAT_VIOLATION_PATTERNS:
+        if rx.search(text or ""):
+            return name
+    return None
+
+def _rewrite_without_list(user_input, bad_reply):
+    """带修正指令让模型重写（非流式一次性调用，低温求稳）"""
+    instruction = (
+        "你刚才的回复出现了列表/步骤编排，这违反了你作为大白的第一铁律。"
+        "请用大白的方式重写：禁编号列表、禁项目符号、禁「第X步/首先/然后/最后」、禁「以下是…建议」导语；"
+        "先接住对方的情绪，然后像聊天一样说出你的看法，最多点一个具体的方法。"
+        "只输出重写后的回复本身，不要任何解释。"
+    )
+    msgs = [
+        {"role": "system", "content": _build_persona_prompt()},
+        {"role": "user", "content": user_input},
+        {"role": "assistant", "content": bad_reply},
+        {"role": "user", "content": instruction},
+    ]
+    return _call_llm(msgs, temperature=0.5).strip()
+
+
+# ============================================================
 # 核心入口：提问
 # ============================================================
 def ask_baymax(user_input, wait_pass2=False, on_chunk=None):
@@ -359,6 +407,21 @@ def ask_baymax(user_input, wait_pass2=False, on_chunk=None):
         reply = "".join(reply_parts).strip()
     except Exception as e:
         return {"reply": f"大白卡住了... {e}", "emotion": "neutral"}
+
+    # 2.5 格式守卫：命中导师腔格式 → 重写一次并播放重写版
+    violation = _find_format_violation(reply)
+    if violation:
+        try:
+            rewritten = _rewrite_without_list(user_input, reply)
+            if rewritten and len(rewritten) >= 20 and not _find_format_violation(rewritten):
+                if on_chunk:
+                    on_chunk("\n\n——等一下，我重新说：\n")
+                    for i in range(0, len(rewritten), 6):
+                        on_chunk(rewritten[i:i + 6])
+                reply = rewritten
+                console.debug(f"[格式守卫] 命中「{violation}」，已重写")
+        except Exception as e:
+            console.debug(f"[格式守卫] 重写失败，保留原版：{e}")
 
     # 3. 保存对话历史
     _messages.append({"role": "user", "content": user_input})
