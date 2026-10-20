@@ -52,3 +52,19 @@ python tools/init_rag_db.py --clear
 python main.py
 ```
 操作提示：按 W 唤醒，按 Space 终端输入文字对话。
+
+## 以下是当前项目进度有关材料和测试示范:
+
+### 1.状态图
+<img width="865" height="621" alt="image" src="https://github.com/user-attachments/assets/ab674053-35ad-4797-956e-7a955fc7751b" />
+
+### 2.测试示范
+<img width="865" height="307" alt="image" src="https://github.com/user-attachments/assets/93c35f15-3d51-4729-8194-7880cd1bf00e" />
+<img width="865" height="277" alt="image" src="https://github.com/user-attachments/assets/79882401-b7f3-4526-af2f-2dbcdefad8b2" />
+<img width="865" height="601" alt="image" src="https://github.com/user-attachments/assets/c8539dd3-9f10-43bf-853f-6533d235742d" />
+<img width="865" height="466" alt="image" src="https://github.com/user-attachments/assets/2960ffb2-fe8a-446b-916e-dde07db73874" />
+
+
+
+
+
