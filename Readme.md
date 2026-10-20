@@ -57,6 +57,7 @@ python main.py
 
 ### 1.状态图
 <img width="865" height="621" alt="image" src="https://github.com/user-attachments/assets/ab674053-35ad-4797-956e-7a955fc7751b" />
+
 ### 2.测试示范
 <img width="865" height="307" alt="image" src="https://github.com/user-attachments/assets/93c35f15-3d51-4729-8194-7880cd1bf00e" />
 <img width="865" height="277" alt="image" src="https://github.com/user-attachments/assets/79882401-b7f3-4526-af2f-2dbcdefad8b2" />
