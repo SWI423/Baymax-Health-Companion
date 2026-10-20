@@ -251,11 +251,21 @@ def _trace_score(content, text):
         return 0.0
     return len(bg & _bigrams(text)) / len(bg)
 
+# 引申性评价词黑名单：这些词出现在记忆里、但用户原话没说过时，
+# 几乎一定是模型把大白的话或自己的评价包装成了"用户态度"
+# （如用户只说"我焦虑实习和软考"，记忆写成"用户重视实习和软考"）
+_INFERENCE_WORDS = ("重视", "愿意", "有价值", "很重要", "渴求", "期待", "在乎", "决心")
+
+def _has_unsourced_inference(clause, user_input):
+    """子句里是否含有'用户没说过'的引申性评价词"""
+    return any(w in clause and w not in user_input for w in _INFERENCE_WORDS)
+
 def _sanitize_memory_content(content, user_input):
     """
     清洗一条 SAVE_MEMORY 内容：
     - 按标点拆子句，逐句验证能否在用户原话里找到字面依据
     - 找不到依据的子句丢弃（几乎全是大白的话或模型的引申）
+    - 含引申性评价词的子句丢弃（大白提议/模型态度的包装）
     - 所有子句都无依据 → 返回 None（整条丢弃）
     """
     content = str(content).strip().rstrip("。")
@@ -263,8 +273,11 @@ def _sanitize_memory_content(content, user_input):
         return None
     clauses = [c.strip() for c in re.split(r"[，,；;。]", content) if c.strip()]
     if len(clauses) <= 1:
-        return content if _trace_score(content, user_input) >= 0.2 else None
-    kept = [c for c in clauses if _trace_score(c, user_input) >= 0.2]
+        if _trace_score(content, user_input) >= 0.2 and not _has_unsourced_inference(content, user_input):
+            return content
+        return None
+    kept = [c for c in clauses
+            if _trace_score(c, user_input) >= 0.2 and not _has_unsourced_inference(c, user_input)]
     return "，".join(kept) if kept else None
 
 def _sanitize_memory_actions(actions, user_input, reply):
