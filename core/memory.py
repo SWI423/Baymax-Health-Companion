@@ -91,13 +91,14 @@ def init_db():
         )
     """)
 
-    # 表6：定时提醒
+    # 表6：定时提醒（date：NULL=每日循环；具体日期=一次性提醒 once）
     c.execute("""
         CREATE TABLE IF NOT EXISTS reminders (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             event_name      TEXT,
             time            TEXT,
             frequency       TEXT,
+            date            TEXT,
             status          TEXT DEFAULT 'active',
             last_triggered  TIMESTAMP,
             created_at      TIMESTAMP
@@ -116,10 +117,30 @@ def init_db():
 
     # 平滑迁移：旧数据库的 memory_points / chat_long 自动补 embedding 字段（无需删库重建）
     _migrate_embedding_columns(c)
+    # 平滑迁移：旧版 reminders 表自动补 date 字段（旧提醒默认每日，date=NULL）
+    _migrate_reminder_date_column(c)
 
     conn.commit()
     conn.close()
     console.debug("数据库初始化完成，7 张表已就绪")
+
+
+def _migrate_reminder_date_column(cursor=None):
+    """旧版 reminders 表（无 date 列）自动补列；旧提醒保持每日循环（date=NULL）"""
+    own_conn = cursor is None
+    if own_conn:
+        conn = _get_conn()
+        c = conn.cursor()
+    else:
+        c = cursor
+    c.execute("PRAGMA table_info(reminders)")
+    cols = [row[1] for row in c.fetchall()]
+    if "date" not in cols:
+        c.execute("ALTER TABLE reminders ADD COLUMN date TEXT")
+        console.info("reminders 表已自动补充 date 字段（旧提醒视为每日循环）")
+    if own_conn:
+        conn.commit()
+        conn.close()
 
 
 def _migrate_embedding_columns(cursor=None):
@@ -355,15 +376,16 @@ def get_recent_health_events(limit=5):
 # ============================================================
 # 表6：定时提醒
 # ============================================================
-def save_reminder(event_name, time_str, frequency="daily"):
+def save_reminder(event_name, time_str, frequency="daily", date=None):
     existing = get_reminder(event_name)
     conn = _get_conn()
     c = conn.cursor()
     if existing and existing["status"] == "active":
-        c.execute("UPDATE reminders SET time = ?, frequency = ?, status = 'active' WHERE event_name = ?", (time_str, frequency, event_name))
+        c.execute("UPDATE reminders SET time = ?, frequency = ?, date = ?, status = 'active' WHERE event_name = ?",
+                  (time_str, frequency, date, event_name))
     else:
-        c.execute("INSERT INTO reminders (event_name, time, frequency, status, created_at) VALUES (?, ?, ?, 'active', ?)",
-                  (event_name, time_str, frequency, datetime.now().isoformat()))
+        c.execute("INSERT INTO reminders (event_name, time, frequency, date, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
+                  (event_name, time_str, frequency, date, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -371,32 +393,34 @@ def save_reminder(event_name, time_str, frequency="daily"):
 def get_reminder(event_name):
     conn = _get_conn()
     c = conn.cursor()
-    c.execute("SELECT id, event_name, time, frequency, status, last_triggered, created_at FROM reminders WHERE event_name = ?", (event_name,))
+    c.execute("SELECT id, event_name, time, frequency, date, status, last_triggered, created_at FROM reminders WHERE event_name = ?", (event_name,))
     row = c.fetchone()
     conn.close()
     if not row: return None
-    return {"id": row[0], "event_name": row[1], "time": row[2], "frequency": row[3], "status": row[4], "last_triggered": row[5], "created_at": row[6]}
+    return {"id": row[0], "event_name": row[1], "time": row[2], "frequency": row[3], "date": row[4], "status": row[5], "last_triggered": row[6], "created_at": row[7]}
 
 
 def get_all_reminders(only_active=False):
     conn = _get_conn()
     c = conn.cursor()
     if only_active:
-        c.execute("SELECT id, event_name, time, frequency, status, last_triggered, created_at FROM reminders WHERE status='active' ORDER BY time ASC")
+        c.execute("SELECT id, event_name, time, frequency, date, status, last_triggered, created_at FROM reminders WHERE status='active' ORDER BY time ASC")
     else:
-        c.execute("SELECT id, event_name, time, frequency, status, last_triggered, created_at FROM reminders ORDER BY time ASC")
+        c.execute("SELECT id, event_name, time, frequency, date, status, last_triggered, created_at FROM reminders ORDER BY time ASC")
     rows = c.fetchall()
     conn.close()
-    return [{"id": r[0], "event_name": r[1], "time": r[2], "frequency": r[3], "status": r[4], "last_triggered": r[5], "created_at": r[6]} for r in rows]
+    return [{"id": r[0], "event_name": r[1], "time": r[2], "frequency": r[3], "date": r[4], "status": r[5], "last_triggered": r[6], "created_at": r[7]} for r in rows]
 
 
-def update_reminder(event_name, new_time=None, new_frequency=None):
+def update_reminder(event_name, new_time=None, new_frequency=None, new_date=None):
     conn = _get_conn()
     c = conn.cursor()
     if new_time:
         c.execute("UPDATE reminders SET time = ? WHERE event_name = ?", (new_time, event_name))
     if new_frequency:
         c.execute("UPDATE reminders SET frequency = ? WHERE event_name = ?", (new_frequency, event_name))
+    if new_date is not None:
+        c.execute("UPDATE reminders SET date = ? WHERE event_name = ?", (new_date, event_name))
     conn.commit()
     conn.close()
 
@@ -413,6 +437,16 @@ def mark_reminder_triggered(event_name):
     conn = _get_conn()
     c = conn.cursor()
     c.execute("UPDATE reminders SET last_triggered = ? WHERE event_name = ?", (datetime.now().isoformat(), event_name))
+    conn.commit()
+    conn.close()
+
+
+def complete_reminder(event_name):
+    """一次性提醒（once）触发后置为 done：保留历史记录，不再参与调度"""
+    conn = _get_conn()
+    c = conn.cursor()
+    c.execute("UPDATE reminders SET status = 'done', last_triggered = ? WHERE event_name = ?",
+              (datetime.now().isoformat(), event_name))
     conn.commit()
     conn.close()
 

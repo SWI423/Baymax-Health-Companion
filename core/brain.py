@@ -12,12 +12,13 @@ import json
 import queue
 import threading
 import requests
+from datetime import datetime, timedelta
 from core import console
 from core import memory
 from core.rag import search_knowledge_base
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import API_KEY, API_URL, MODEL_NAME, LANGUAGE, Keywords, QUICK_CONCERN_KEYWORDS
+from config import API_KEY, API_URL, MODEL_NAME, LANGUAGE, Keywords, QUICK_CONCERN_KEYWORDS, QUICK_SERIOUS_KEYWORDS
 from prompts import (SYSTEM_PROMPT, EXTRACT_PROMPT,
                      SUMMARY_PROMPT_USER, SUMMARY_PROMPT_MEMORY, SUMMARY_PROMPT_LONG,
                      FEWSHOT_EXAMPLES)
@@ -57,17 +58,142 @@ MAX_MESSAGES = 20
 VALID_EMOTIONS = {"neutral", "concern", "alert", "serious", "suspect", "sleepy"}
 emotion_queue = queue.Queue()
 
+# 动作队列：异步判断（如理由考察 accept/reject）的结果由 worker 线程投递，
+# 主循环统一消费执行状态切换 —— 保证所有状态变更都发生在主循环单线程内
+action_queue = queue.Queue()
+
+
+def queue_action(action):
+    """线程安全地投递一个待主循环执行的异步动作"""
+    action_queue.put(action)
+
+
+def get_current_time_context():
+    """大白的时间感知：注入当前年月日 + 星期 + 时刻（设定提醒时用于理解相对日期）"""
+    now = datetime.now()
+    weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+    return f"现在是{now.year}年{now.month}月{now.day}日 {weekdays[now.weekday()]} {now.strftime('%H:%M')}"
+
+
+def resolve_relative_date(text, now=None):
+    """
+    把用户口头日期换算成 YYYY-MM-DD：
+      - 今天/明天/后天/大后天
+      - 下周一~下周日（指下周的周X）
+      - YYYY-MM-DD / YYYY年M月D日 具体日期
+    无法识别返回 None（由调用方回退为每日提醒）
+    """
+    if not text:
+        return None
+    t = str(text).strip()
+    now = now or datetime.now()
+    today = now.date()
+    if "今天" in t:
+        return today.isoformat()
+    if "明天" in t:
+        return (today + timedelta(days=1)).isoformat()
+    if "后天" in t:
+        return (today + timedelta(days=2)).isoformat()
+    if "大后天" in t:
+        return (today + timedelta(days=3)).isoformat()
+    m = re.search(r"下(?:个)?(?:星期|周)([一二三四五六日天])", t)
+    if m:
+        idx = "一二三四五六日".find(m.group(1))
+        if idx < 0:
+            return None
+        # 本周的周X → +7 即下周的周X
+        days_ahead = (idx - now.weekday()) % 7 + 7
+        return (today + timedelta(days=days_ahead)).isoformat()
+    m = re.search(r"(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})", t)
+    if m:
+        try:
+            return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+        except ValueError:
+            return None
+    return None
+
+
+def judge_reason(user_text):
+    """
+    理由考察（状态图 S6/S7 的"大模型判断理由"）：
+    用户在提醒/催促下说还没完成并给了理由，判断理由是否充分。
+    返回 "accept"（允许不完成）或 "reject"（继续督促+开导）；
+    调用失败时保守返回 "reject"（提醒主题优先，不让提醒丢失）。
+    """
+    prompt = (
+        "你是大白，用户的私人健康助理。用户在提醒催促下说还没完成，并给了理由。\n"
+        f"【用户的回应】{user_text}\n\n"
+        "判断这个理由是否充分：\n"
+        "- accept：理由真实且充分（身体不适、临时突发状况、任务已无意义等）→ 允许不完成\n"
+        "- reject：理由牵强、拖延、逃避（懒得做、忘了、不想等）→ 应继续督促并开导\n"
+        "只输出一个词：accept 或 reject。"
+    )
+    try:
+        resp = requests.post(
+            API_URL,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"},
+            json={"model": MODEL_NAME, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1},
+            timeout=20,
+        )
+        data = resp.json()
+        verdict = data["choices"][0]["message"]["content"].strip().lower()
+        if "accept" in verdict:
+            return "accept"
+        return "reject"
+    except Exception as e:
+        console.error(f"理由考察失败（保守判 reject）：{e}")
+        return "reject"
+
 
 def predict_emotion_quick(user_input):
     """
     输入即刻预判：在调用大模型之前，根据关键词立即给出情绪标签。
     随后 Pass 2 提取到的精准情绪会覆盖它（见 state_machine.handle_chat）。
+    优先级：concern（健康关切）> serious（严肃/硬撑）> neutral。
     """
     if not user_input:
         return None
     for kw in QUICK_CONCERN_KEYWORDS:
         if kw in user_input:
             return "concern"
+    for kw in QUICK_SERIOUS_KEYWORDS:
+        if kw in user_input:
+            return "serious"
+    return None
+
+
+# ============================================================
+# 催促场景三分类快判（状态图 E10 确认完成 / E11 给理由）
+# ============================================================
+# 否定/未完成词优先（"还没完成"绝不能误判成"完成"）
+QUICK_NOT_COMPLETED_KEYWORDS = [
+    "还没", "没完成", "没有", "没做完", "还没好", "还没做完",
+    "再等", "等一下", "马上", "快了", "别催", "别急", "稍等",
+    "给我点时间", "等一会", "等会儿", "再给我", "还在做", "正在", "还没呢",
+]
+QUICK_COMPLETED_KEYWORDS = [
+    "完成", "好了", "搞定", "可以了", "做完", "结束", "好啦",
+    "没问题", "成功", "哦了", "弄完", "干完", "搞完",
+]
+
+
+def predict_completion_quick(user_input):
+    """
+    催促场景回应三分类快判：
+      - "completed"      → 用户确认完成（状态图 E10）
+      - "not_completed"  → 用户给理由/还没完成（状态图 E11，由大模型判断接受与否）
+      - None             → 闲聊/无法快判 → 交给大模型正常对话
+    否定优先：先扫"还没/没完成"再扫"完成"，避免反义误判。
+    """
+    if not user_input:
+        return None
+    t = str(user_input)
+    for kw in QUICK_NOT_COMPLETED_KEYWORDS:
+        if kw in t:
+            return "not_completed"
+    for kw in QUICK_COMPLETED_KEYWORDS:
+        if kw in t:
+            return "completed"
     return None
 
 
@@ -82,6 +208,10 @@ def _build_persona_prompt():
         lang_note = f"默认使用 {LANGUAGE} 回复用户。"
 
     prompt += f"""
+
+【当前时间】
+{get_current_time_context()}
+用户提到"明天""后天""下周""几月几号"等设定提醒时，据此理解相对日期，并在 SET_REMINDER 的 date 字段里写出相对词或具体日期。
 
 【记忆规则】
 用户问"你记得我什么""你记得我喜欢…吗"时，直接从资料层陈述你记得的内容，不要说"已记录"——"已记录"只用于确认新信息已存档。只能从【用户信息】【记忆点】【往日摘要】读取，不要从【相关历史与记忆】推断。
@@ -461,7 +591,17 @@ def _execute_actions(actions):
         try:
             if atype == "SET_REMINDER":
                 t = _normalize_time(a.get("time"))
-                if a.get("event") and t: memory.save_reminder(a["event"], t, a.get("frequency", "daily"))
+                if a.get("event") and t:
+                    date_word = a.get("date") or ""
+                    if date_word:
+                        # 相对日期 → 具体日期（明天/下周一/几月几号），换算成功为一次性提醒
+                        d = resolve_relative_date(date_word)
+                        if d:
+                            memory.save_reminder(a["event"], t, frequency="once", date=d)
+                            console.action(f"设定一次性提醒：{a['event']} {t}（{d}）")
+                            continue
+                    memory.save_reminder(a["event"], t, a.get("frequency", "daily"))
+                    console.action(f"设定每日提醒：{a['event']} {t}")
             elif atype == "UPDATE_REMINDER":
                 t = _normalize_time(a.get("time"))
                 if a.get("event") and t: memory.update_reminder(a["event"], new_time=t)

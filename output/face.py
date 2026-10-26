@@ -113,7 +113,8 @@ def set_emotion(emotion_name):
     console.debug(f"切换情绪: {emotion_name}")
 
     if emotion_name == "sleepy":
-        hold_closed(speed=20.0)
+        # 👈 缓慢闭眼：帧速 4.0（10帧 ÷ 4 ≈ 2.5 秒），比默认 20.0 更舒缓，符合"渐渐睡去"
+        hold_closed(speed=4.0)
     elif emotion_name == "greet":
         blink(speed=100.0, count=2)
         _next_blink_interval = 3.0

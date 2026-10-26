@@ -100,12 +100,14 @@ emotion 判断标准：
 
 actions 数组元素类型：
 - {{"type": "SAVE_MEMORY", "content": "..."}}：值得长期记住的内容——① 个人信息（名字、年龄、生日、家人、过敏史）② 偏好（喜好、讨厌、习惯）③ 时间性事实（具体时间点、持续时长、事件发生时间），例："现在凌晨2点41分"→"用户在凌晨2点41分还在熬夜" ④ 用户明确要求记住的事
-- {{"type": "SET_REMINDER", "event": "事件名", "time": "HH:MM", "frequency": "daily"}}
+- {{"type": "SET_REMINDER", "event": "事件名", "time": "HH:MM", "frequency": "daily", "date": "..."}}
+  date 字段规则（你拥有当前日期时间）：用户指定了"明天/后天/下周一/几月几号"等日期时，把相对词或具体日期原样填入 date（如 "明天"、"2026-10-30"）；用户只说时间没说日期时省略 date（=每天）；用户说"今晚/明晚"仍省略 date（=每天该时刻）。
 - {{"type": "UPDATE_REMINDER", "event": "事件名", "time": "HH:MM"}}
 - {{"type": "CANCEL_REMINDER", "event": "事件名"}}
 
 示例：
 "我喜欢吃炸鸡，帮我记住" → {{"emotion": "neutral", "actions": [{{"type": "SAVE_MEMORY", "content": "用户喜欢吃炸鸡"}}]}}
+"明天早上9点叫我起床" → {{"emotion": "neutral", "actions": [{{"type": "SET_REMINDER", "event": "起床", "time": "09:00", "date": "明天"}}]}}
 "把睡觉提醒改到晚上10点" → {{"emotion": "neutral", "actions": [{{"type": "UPDATE_REMINDER", "event": "睡觉", "time": "22:00"}}]}}
 "我不想上学" → {{"emotion": "concern", "actions": []}}
 "你记得我对什么过敏吗" → {{"emotion": "neutral", "actions": []}}
