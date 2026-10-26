@@ -37,12 +37,12 @@ _current_reminder = None
 
 
 def _on_reminder_due(reminder):
-    """定时到点（scheduler 线程）：只投递事件，由主循环统一处理，避免跨线程改状态"""
+    """定时到点（scheduler 线程）：只投递事件（携带提醒上下文），由主循环统一处理"""
     global _current_reminder
     _current_reminder = reminder
     event = "WAKE_TIMER" if fsm.state == State.SLEEP else "TIMER_ALERT"
-    console.action(f"调度器触发：{event}（{reminder['event_name']}）")
-    post_event(event)
+    console.action(f"定时提醒 触发：{reminder['event_name']}")
+    post_event(event, payload=reminder)
 
 
 scheduler = ReminderScheduler(on_due=_on_reminder_due)
@@ -50,12 +50,12 @@ scheduler = ReminderScheduler(on_due=_on_reminder_due)
 
 def _say_reminder(reminder):
     """大白口吻说出提醒内容（进入 S6 提醒 / 5分钟重复提醒时调用）"""
-    print(f"\n大白：{REMIND_REPLY.format(event_name=reminder['event_name'])}")
+    print(f"\n(●––●): {REMIND_REPLY.format(event_name=reminder['event_name'])}")
 
 
 def _say_urge():
     """进入 S7 催促（理由被拒后）→ 大白开口追问"""
-    print(f"\n大白：{URGE_REPLY}")
+    print(f"\n(●––●): {URGE_REPLY}")
 
 
 def _consume_action_queues():
@@ -65,15 +65,15 @@ def _consume_action_queues():
         atype = act.get("type")
 
         if atype == "REMINDER_REASON":
-            # 只在仍处于提醒状态时落地考察结果（期间用户再次回应则丢弃旧结果）
-            if fsm.state != State.REMIND:
-                console.debug("理由考察结果到达时已离开提醒状态，丢弃")
+            # 只在提醒上下文中落地考察结果（期间用户再次回应则丢弃旧结果）
+            if not fsm.pending_reminder:
+                console.debug("理由考察结果到达时提醒上下文已结束，丢弃")
                 continue
             if act.get("verdict") == "accept":
-                print(f"\n大白：{ACCEPT_REASON_REPLY}")
-                fsm.handle_event("REMIND_CONFIRMED")  # → 回待机
+                print(f"\n(●––●): {ACCEPT_REASON_REPLY}")
+                fsm.handle_event("REMIND_CONFIRMED")  # → 回待机（清上下文）
             else:
-                print(f"\n大白：{REJECT_REASON_REPLY}")
+                print(f"\n(●––●): {REJECT_REASON_REPLY}")
                 fsm.change_state(State.URGE)  # → 催促+开导（进入 URGE 会触发追问口播）
 
         elif atype == "REPEAT_REMIND":
@@ -99,6 +99,7 @@ def main():
     clock = pygame.time.Clock()
     fsm.change_state(State.SLEEP)
     scheduler.start()
+    brain.backfill_name_from_profile()  # 启动回填：没名字时从记忆点解析（问题3）
 
     running = True
     prev_state = State.SLEEP  # 启动即休眠，不触发首次摘要/招呼
@@ -144,7 +145,7 @@ def main():
         if fsm.state == State.GREET and prev_state != State.GREET:
             # 👈 唤醒招呼（config 模板：称呼+时段问候+自我介绍）
             profile = memory.get_user_profile()
-            print(f"\n大白：{build_greeting(profile.get('name') or None)}")
+            print(f"\n(●––●): {build_greeting(profile.get('name') or None)}")
         if fsm.state == State.REMIND and prev_state != State.REMIND and _current_reminder:
             _say_reminder(_current_reminder)
         if fsm.state == State.URGE and prev_state != State.URGE:

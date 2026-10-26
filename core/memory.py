@@ -14,6 +14,7 @@ import sqlite3
 import os
 import sys
 import json
+import re
 from datetime import datetime, date
 
 import numpy as np
@@ -218,10 +219,63 @@ def get_user_profile(user_id="default"):
 # ============================================================
 # 表2：记忆点
 # ============================================================
-def save_memory_point(content, source="user_command", importance=5):
+# 记忆来源 → 重要性（用户主动要求记住 > 大白自动记住 > 摘要记住）
+_SOURCE_IMPORTANCE = {
+    "user_require": 10,
+    "user_command": 10,   # 旧数据源名，视同要求记住
+    "user_auto": 5,
+    "auto": 5,
+    "summary": 3,
+}
+
+
+def _source_importance(source):
+    return _SOURCE_IMPORTANCE.get(str(source), 5)
+
+
+def save_memory_point(content, source="user_auto", importance=None):
+    """
+    记忆写入：查重 + 来源优先级覆盖（问题4方案）。
+    同内容已存在时：
+      - 已有记忆级别 ≥ 新记忆级别 → 跳过（不覆盖；用户主动要求的记忆最准确，不被低级覆盖）
+      - 新记忆级别更高 → 覆盖（更新内容/来源/重要性/向量/时间）
+    无重复 → 正常插入。
+    """
     from core.rag import get_embedding  # 延迟导入，避免与 rag 模块循环依赖
 
-    # 存入时先把内容转成向量（JSON 字符串），失败不阻塞内容保存
+    if importance is None:
+        importance = _source_importance(source)
+
+    norm = re.sub(r"\s+", "", str(content)).strip()
+    conn = _get_conn()
+    c = conn.cursor()
+
+    # 查重（规范化文本完全匹配；语义层由检索去重）
+    c.execute("SELECT id, content, importance FROM memory_points")
+    for rid, old_content, old_imp in c.fetchall():
+        if re.sub(r"\s+", "", old_content or "") == norm:
+            conn.close()
+            if old_imp >= importance:
+                console.debug(f"[记忆] 已有更高/同级记忆，跳过覆盖：{str(content)[:20]}")
+                return False
+            # 新记忆级别更高 → 覆盖
+            vec = None
+            try:
+                v = get_embedding(content)
+                if v is not None:
+                    vec = json.dumps(v.tolist())
+            except Exception as e:
+                console.warn(f"记忆点向量化失败（内容仍会保存）：{e}")
+            conn = _get_conn()
+            c = conn.cursor()
+            c.execute("UPDATE memory_points SET content=?, source=?, importance=?, embedding=?, created_at=? WHERE id=?",
+                      (content, source, importance, vec, datetime.now().isoformat(), rid))
+            conn.commit()
+            conn.close()
+            console.debug(f"[记忆] 高优先级覆盖：{str(content)[:20]}")
+            return True
+
+    # 无重复 → 插入
     embedding_str = None
     try:
         vec = get_embedding(content)
@@ -230,14 +284,13 @@ def save_memory_point(content, source="user_command", importance=5):
     except Exception as e:
         console.warn(f"记忆点向量化失败（内容仍会保存）：{e}")
 
-    conn = _get_conn()
-    c = conn.cursor()
     c.execute("""
         INSERT INTO memory_points (content, source, importance, embedding, created_at)
         VALUES (?, ?, ?, ?, ?)
     """, (content, source, importance, embedding_str, datetime.now().isoformat()))
     conn.commit()
     conn.close()
+    return True
 
 
 def get_all_memory_points():
@@ -544,9 +597,9 @@ def search_long_term_memory_by_vector(query, limit=3, threshold=0.5):
 
     if results:
         # 只汇报命中条数和最高分，明细不打印
-        console.mem(f"语义命中 {len(results)} 条 · 最高 {results[0]['score']:.2f}")
+        console.mem(f"{len(results)} 最高{results[0]['score']:.2f}")
     else:
-        console.mem("语义记忆未命中")
+        console.mem("0")
     return results
 
 

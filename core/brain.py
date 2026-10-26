@@ -457,7 +457,9 @@ def _sanitize_memory_actions(actions, user_input, reply):
         if any(len(bg & e) / max(1, len(bg | e)) >= 0.6 for e in existing_bg):
             console.debug(f"[过滤] 与已有记忆重复：{content}")
             continue
-        cleaned.append({"type": "SAVE_MEMORY", "content": content})
+        # 来源分级：用户主动要求记住 > 大白自动记住（问题4：要求记住最准确，优先级最高）
+        src = "user_require" if any(k in user_input for k in ("记住", "记一下", "记着", "别忘了", "帮我记", "记下来")) else "user_auto"
+        cleaned.append({"type": "SAVE_MEMORY", "content": content, "source": src})
     return cleaned
 
 
@@ -467,7 +469,7 @@ def _pass2_worker(user_input, reply):
     extracted["actions"] = _sanitize_memory_actions(extracted["actions"], user_input, reply)
     if extracted["actions"]:
         _execute_actions(extracted["actions"])
-        console.action(f"后台执行 {len(extracted['actions'])} 项操作")
+        console.action(f"操作 执行 {len(extracted['actions'])} 项")
     emotion_queue.put(extracted["emotion"])
     # 情绪由状态机层汇报，这里只留调试明细
     console.debug(f"pass2 emotion={extracted['emotion']}")
@@ -598,17 +600,18 @@ def _execute_actions(actions):
                         d = resolve_relative_date(date_word)
                         if d:
                             memory.save_reminder(a["event"], t, frequency="once", date=d)
-                            console.action(f"设定一次性提醒：{a['event']} {t}（{d}）")
+                            console.action(f"定时提醒 已设定：{a['event']} {t}（{d}）")
                             continue
                     memory.save_reminder(a["event"], t, a.get("frequency", "daily"))
-                    console.action(f"设定每日提醒：{a['event']} {t}")
+                    console.action(f"定时提醒 已设定：{a['event']} {t}")
             elif atype == "UPDATE_REMINDER":
                 t = _normalize_time(a.get("time"))
                 if a.get("event") and t: memory.update_reminder(a["event"], new_time=t)
             elif atype == "CANCEL_REMINDER":
                 if a.get("event"): memory.cancel_reminder(a["event"])
             elif atype == "SAVE_MEMORY":
-                if a.get("content"): _save_memory_from_content(a["content"])
+                if a.get("content"):
+                    _save_memory_from_content(a["content"], source=a.get("source", "user_auto"))
         except Exception as e:
             console.error(f"后台动作失败：{e}")
 
@@ -626,30 +629,75 @@ def _normalize_time(t):
     return None
 
 
-def _save_memory_from_content(content):
+def _parse_name(content):
+    """
+    从记忆内容解析用户名字（问题3修复：Pass2 输出"用户叫小陈/用户的名字是小陈"格式，
+    旧正则只认"我叫"格式导致名字没进 user_profile）。
+    返回名字字符串，解析失败返回 None。
+    """
+    patterns = [
+        # "用户的名字是小陈" / "名字是小陈" / "名字叫小陈"
+        r"(?:用户|我)?的?名字(?:是|为|叫)?[\s:：]*([^\s，,。!！?？]{1,8})",
+        # "用户叫小陈" / "我叫小陈" / "名叫小陈" / "小陈"（记忆点本身）
+        r"(?:用户|我|你)?\s*(?:叫|名叫|叫做)\s*([^\s，,。!！?？]{1,8})",
+    ]
+    for p in patterns:
+        m = re.search(p, content)
+        if m:
+            name = m.group(1).strip()
+            # 排除数字/岁数/称谓词混入
+            if name and not re.search(r"[\d岁]|用户|同学|朋友|兄弟|姐妹|名字|称呼", name):
+                return name
+    return None
+
+
+def _save_memory_from_content(content, source="user_auto"):
+    """
+    保存一条记忆：① 个人信息（名字/生日/年龄/家人）同步更新 user_profile；
+    ② 统一写入记忆点（带来源与重要性，查重+优先级覆盖见 memory.save_memory_point）。
+    """
     saved = False
-    if any(w in content for w in Keywords.NAME_HINTS) and not any(w in content for w in Keywords.SIBLING_HINTS):
-        name = re.sub(r".*?叫(?:做)?", "", content)
-        name = re.split(r"[，,。 ]", name)[0].strip()
-        if name and not re.search(r"[\d岁]", name):
-            memory.update_user_profile(name=name);
+    if not any(w in content for w in Keywords.SIBLING_HINTS):
+        name = _parse_name(content)
+        if name:
+            memory.update_user_profile(name=name)
             saved = True
     if "生日" in content:
         bday = re.sub(r".*?生日(?:是|为)?", "", content).strip("，,。 ")
         if bday: memory.update_user_profile(birthday=bday); saved = True
     if re.search(r"\d+\s*岁", content):
         age = re.search(r"\d+\s*岁", content).group(0)
-        memory.update_user_profile(age=age);
+        memory.update_user_profile(age=age)
         saved = True
     if any(w in content for w in Keywords.SIBLING_HINTS):
-        memory.update_user_profile(sibling=content);
+        memory.update_user_profile(sibling=content)
         saved = True
 
-    if not saved:
-        memory.save_memory_point(content, source="user_command", importance=8)
-        console.action(f"已记住：{content}")
+    # 统一写入记忆点（供语义检索命中）；个人信息同样入库
+    memory.save_memory_point(content, source=source)
+    if saved:
+        console.action("记忆 用户资料已更新")
     else:
-        console.action("用户资料已更新")
+        console.action(f"记忆 已保存：{content[:30]}")
+
+
+def backfill_name_from_profile():
+    """
+    启动回填（问题3）：user_profile 无名字时，从已有记忆点解析用户名字。
+    修复"第2次启动打招呼仍叫不出名字"：名字进了记忆点但没同步到 user_profile。
+    """
+    try:
+        profile = memory.get_user_profile()
+        if profile.get("name"):
+            return
+        for mp in memory.get_all_memory_points():
+            name = _parse_name(mp["content"])
+            if name:
+                memory.update_user_profile(name=name)
+                console.action(f"记忆 回填用户名：{name}")
+                return
+    except Exception as e:
+        console.error(f"名字回填失败：{e}")
 
 
 def wait_pending_pass2():
@@ -688,7 +736,7 @@ def do_summary():
     try:
         r2 = call_llm(SUMMARY_PROMPT_MEMORY.format(dialog=dialog))
         m = re.search(r"\[MEMORY\](.+?)(?=\n\[|\n\n|$)", r2, re.DOTALL)
-        if m: memory.save_memory_point(m.group(1).strip(), source="ai_summary", importance=5)
+        if m: memory.save_memory_point(m.group(1).strip(), source="summary")
         m = re.search(r"\[HEALTH\](.+?)(?=\n\[|\n\n|$)", r2, re.DOTALL)
         if m: memory.save_health_event("summary", m.group(1).strip())
     except:

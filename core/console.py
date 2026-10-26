@@ -2,10 +2,11 @@
 统一终端输出层：收敛噪音、排版一致。
 
 运行时只保留必要信息，一行一条：
+    [记忆命中:3 最高0.58]
     [RAG] 知识库命中 2 条 · 最高 0.73
-    [记忆] 语义命中 1 条 · 最高 0.62
     [情绪] 即时预判 → concern
-    [动作] 已记住：用户对青霉素过敏
+    [动作 | 记忆 已保存：用户对青霉素过敏]
+    [动作 | 定时提醒 已设定：起床 09:00（2026-10-27）]
 
 排障细节（FSM 状态跳转、face 内部、启动横幅等）走 debug()，
 需要时把 DEBUG 改成 True 即可，默认静音。
@@ -17,9 +18,9 @@ DEBUG = False
 _TAGS = {
     "info":    "[信息]",
     "rag":     "[RAG]",
-    "mem":     "[记忆]",
+    "mem":     "[记忆命中:{0}]",
     "emotion": "[情绪]",
-    "action":  "[动作]",
+    "action":  "[动作 | {0}]",
     "warn":    "[提醒]",
     "error":   "[错误]",
     "debug":   "[调试]",
@@ -27,7 +28,11 @@ _TAGS = {
 
 
 def _emit(channel, msg):
-    print(f"{_TAGS[channel]} {msg}", flush=True)
+    fmt = _TAGS[channel]
+    if "{" in fmt:
+        print(fmt.format(msg), flush=True)
+    else:
+        print(f"{fmt} {msg}", flush=True)
 
 
 def info(msg):    _emit("info", msg)
