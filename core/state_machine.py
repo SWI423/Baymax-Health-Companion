@@ -9,7 +9,7 @@ from core import console
 from core import brain
 from core import memory
 from config import (COMPLETE_REPLY, ACCEPT_REASON_REPLY, REJECT_REASON_REPLY,
-                    FAREWELL_REPLY, FAREWELL_TRIGGER)
+                    FAREWELL_REPLY, FAREWELL_TRIGGER, CARE_OPENERS)
 
 class State(Enum):
     SLEEP = "S1_休眠"
@@ -21,7 +21,13 @@ class State(Enum):
     URGE = "S7_催促"
 
 class BaymaxFSM:
-    def __init__(self):
+    def __init__(self, on_output=None, on_bot_start=None, on_chunk=None, on_chat_done=None):
+        """输出通道抽象：默认=命令行 print；桌宠版注入 UI 回调（行为不变）
+        on_output(text)    : 完整口播一句（招呼/提醒/告别/完成等）
+        on_bot_start()     : 流式说话开始（输出前缀）
+        on_chunk(chunk)    : 流式 token
+        on_chat_done(reply, emotion) : 聊天回合结束
+        """
         self.state = State.SLEEP
         self.state_enter_time = time.time()
         self.wake_reason = None
@@ -29,10 +35,22 @@ class BaymaxFSM:
         self.pause_timeout = False
         self.emotion_hold_timer = 0.0 # 👈 记录情绪保持时间
         self.pending_reminder = None   # 👈 待确认提醒上下文（提醒口播后进聊天，输入先走三出口）
+        self._sensor_kind = None       # 👈 传感类型：fall摔倒 / heart心率偏高
+        self._output = on_output or (lambda t: print(f"\n(●––●): {t}") if t else None)
+        self._on_bot_start = on_bot_start or (lambda: print("\n(●––●): ", end="", flush=True))
+        self._on_chunk = on_chunk or (lambda c: print(c, end="", flush=True))
+        self._on_chat_done = on_chat_done or (lambda reply, emotion: None)
 
     def set_emotion(self, emotion):
         self.current_emotion = emotion
         self.emotion_hold_timer = time.time() # 重置情绪计时器
+
+    @staticmethod
+    def _parse_sensor_kind(payload):
+        """传感类型解析：payload 可为 {"kind":"fall"} / {"kind":"heart"} / 纯字符串"""
+        if isinstance(payload, dict):
+            return payload.get("kind", "fall")
+        return "fall"
 
     def change_state(self, new_state):
         if self.state == new_state: return
@@ -54,6 +72,7 @@ class BaymaxFSM:
             pass
         elif self.state == State.CARE:
             self.set_emotion("concern")
+            self._start_care_flow()   # 👈 传感关怀主流程：主动询问 + 大模型建议
         elif self.state == State.REMIND:
             self.set_emotion("alert")
         elif self.state == State.URGE:
@@ -73,6 +92,8 @@ class BaymaxFSM:
                 self.wake_reason = event_type.split("_")[1].lower()
                 if self.wake_reason == "timer":
                     self.pending_reminder = payload  # 定时唤醒：携带提醒上下文
+                elif self.wake_reason == "sensor":
+                    self._sensor_kind = self._parse_sensor_kind(payload)
                 self.change_state(State.GREET)
         elif self.state == State.GREET:
             if event_type == "GREET_FINISH":
@@ -83,7 +104,9 @@ class BaymaxFSM:
             if event_type == "USER_INPUT":
                 self.change_state(State.CHAT)
                 self.handle_chat(payload)
-            elif event_type == "SENSOR_ALERT": self.change_state(State.CARE)
+            elif event_type == "SENSOR_ALERT":
+                self._sensor_kind = self._parse_sensor_kind(payload)
+                self.change_state(State.CARE)
             elif event_type == "TIMER_ALERT":
                 self.pending_reminder = payload  # 提醒在身：携带上下文进提醒状态
                 self.change_state(State.REMIND)
@@ -95,12 +118,17 @@ class BaymaxFSM:
                     self._handle_reminder_reply(payload)
                 else:
                     self.handle_chat(payload)
-            elif event_type == "SENSOR_ALERT": self.change_state(State.CARE)
+            elif event_type == "SENSOR_ALERT":
+                self._sensor_kind = self._parse_sensor_kind(payload)
+                self.change_state(State.CARE)
             elif event_type == "TIMEOUT_CHAT": self.change_state(State.IDLE)
         elif self.state == State.CARE:
             if event_type == "USER_INPUT":
                 self.change_state(State.CHAT)
                 self.handle_chat(payload)
+            elif event_type == "CARE_FLOW_DONE":
+                # 关怀建议说完 → 转聊天等用户回答，继续关怀对话
+                self.change_state(State.CHAT)
             elif event_type == "TIMEOUT_CARE": self.change_state(State.IDLE)
         elif self.state == State.REMIND:
             # 👈 状态图 S6：E10 确认完成 → 结束；E11 给理由 → 大模型判断（聊天语境）；
@@ -122,6 +150,26 @@ class BaymaxFSM:
                 self.pending_reminder = None  # 放弃本次提醒
                 self.change_state(State.IDLE)
 
+    def _start_care_flow(self):
+        """S5 关心状态核心：传感异常时大白主动开口（固定开场），
+        随后后台走 Agent 路径（结合记忆/RAG/工具）生成完整询问+建议，
+        完成后经 action_queue 投递 CARE_FLOW_DONE，主循环转聊天等用户回答。"""
+        kind = self._sensor_kind or "fall"
+        console.action(f"传感关怀 {kind}")
+        opener = CARE_OPENERS.get(kind, CARE_OPENERS["fall"])
+        self._output(opener)
+
+        def worker():
+            try:
+                self._on_bot_start()
+                result = brain.ask_care_advice(kind, on_chunk=self._on_chunk)
+                brain.queue_action({"type": "CARE_FLOW_DONE", "reply": result.get("reply", "")})
+            except Exception as e:
+                console.error(f"关怀流程失败：{e}")
+                brain.queue_action({"type": "CARE_FLOW_DONE", "reply": ""})
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def handle_chat(self, user_text):
         if not user_text: return
         # 👈 输入即刻预判：调用大模型之前，先按关键词把表情切到 concern/serious
@@ -130,22 +178,23 @@ class BaymaxFSM:
             console.emotion(f"即时预判 → {quick_emotion}（关键词命中）")
             self.set_emotion(quick_emotion)
         def _chat_worker():
-            print("\n(●––●): ", end="", flush=True)
-            result = brain.ask_baymax(user_text, wait_pass2=True, on_chunk=lambda c: print(c, end="", flush=True))
-            print()
+            # Agent 化主入口：模型自主决策调用工具（记忆/定时/知识库），再出人话
+            self._on_bot_start()
+            result = brain.ask_baymax_with_tools(user_text, wait_pass2=True, on_chunk=self._on_chunk)
             # 👈 异步精准覆盖：Pass 2 算出的真实情绪，立即覆盖之前的预判
             final_emotion = result.get("emotion")
             if final_emotion:
                 console.emotion(f"精准覆盖 → {final_emotion}")
                 self.set_emotion(final_emotion)
             self.state_enter_time = 0 # 触发超时，回到待机
+            self._on_chat_done(result.get("reply", ""), final_emotion or "")
         threading.Thread(target=_chat_worker, daemon=True).start()
 
     def _finish_service_and_sleep(self, payload):
         """用户说'满意'结束服务：大白告别 → 进入休眠（不调大模型，告别语为固定人设台词）"""
         console.action("服务 结束并休眠")
         farewell = FAREWELL_REPLY
-        print(f"\n(●––●): {farewell}")
+        self._output(farewell)
         # 保留一段完整对话记录（用户最后一句 + 告别语）
         memory.save_chat("user", str(payload).strip())
         memory.save_chat("assistant", farewell)
@@ -163,7 +212,7 @@ class BaymaxFSM:
         """
         quick = brain.predict_completion_quick(user_text)
         if quick == "completed":
-            print(f"\n(●––●): {COMPLETE_REPLY}")
+            self._output(COMPLETE_REPLY)
             self.pending_reminder = None
             self.change_state(State.IDLE)
         elif quick == "not_completed":

@@ -19,6 +19,9 @@ from datetime import datetime, date
 
 import numpy as np
 
+# 最近一次记忆检索命中（条数, 最高分），供桌宠状态区显示
+last_memory_hits = [(0, 0.0)]
+
 from core import console
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -597,8 +600,10 @@ def search_long_term_memory_by_vector(query, limit=3, threshold=0.5):
 
     if results:
         # 只汇报命中条数和最高分，明细不打印
+        last_memory_hits[0] = (len(results), results[0]["score"])
         console.mem(f"{len(results)} 最高{results[0]['score']:.2f}")
     else:
+        last_memory_hits[0] = (0, 0.0)
         console.mem("0")
     return results
 

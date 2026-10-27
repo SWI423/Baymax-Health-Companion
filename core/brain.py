@@ -28,8 +28,9 @@ from prompts import (SYSTEM_PROMPT, EXTRACT_PROMPT,
 # ==========================================
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.output_parsers import StrOutputParser
+from core.tools import TOOLS
 
 # 初始化企业级模型
 llm = ChatOpenAI(
@@ -57,6 +58,15 @@ _messages = []
 MAX_MESSAGES = 20
 VALID_EMOTIONS = {"neutral", "concern", "alert", "serious", "suspect", "sleepy"}
 emotion_queue = queue.Queue()
+
+# 用户可改人设补充（桌宠设置页写入；核心提示词无 UI 入口）
+persona_extra = ""
+
+
+def set_persona_extra(text):
+    """桌宠设置页调用：附加一段用户补充设定到人设（不影响核心提示词）"""
+    global persona_extra
+    persona_extra = (text or "").strip()
 
 # 动作队列：异步判断（如理由考察 accept/reject）的结果由 worker 线程投递，
 # 主循环统一消费执行状态切换 —— 保证所有状态变更都发生在主循环单线程内
@@ -222,10 +232,12 @@ def _build_persona_prompt():
 【输出要求】
 自然说话，不要输出任何标签、记号或格式符号。当用户要求你记住某事，或设置/修改/取消提醒时，用自然语言确认即可，后台会有另一个程序负责真正执行。
 """
+    if persona_extra:
+        prompt += f"\n【用户补充设定】\n{persona_extra}\n"
     return prompt
 
 
-def _build_data_context(user_input=None):
+def _build_data_context(user_input=None, include_medical=True):
     sections = []
 
     profile = memory.get_user_profile()
@@ -275,11 +287,13 @@ def _build_data_context(user_input=None):
                     text += f"- [{m['source']}] {m['content']}\n"
             sections.append(text.rstrip())
 
-        medical_knowledge = search_knowledge_base(user_input, top_k=2)
-        if medical_knowledge:
-            text = "【参考医疗知识】\n"
-            for k in medical_knowledge: text += f"- {k}\n"
-            sections.append(text.rstrip())
+        if include_medical:
+            # 旧路径（ask_baymax）：每次无条件注入知识库
+            medical_knowledge = search_knowledge_base(user_input, top_k=2)
+            if medical_knowledge:
+                text = "【参考医疗知识】\n"
+                for k in medical_knowledge: text += f"- {k}\n"
+                sections.append(text.rstrip())
 
     return "以下是你记住的关于用户的资料，供你参考：\n\n" + "\n\n".join(sections) if sections else "（暂无用户资料记录）"
 
@@ -463,13 +477,16 @@ def _sanitize_memory_actions(actions, user_input, reply):
     return cleaned
 
 
-def _pass2_worker(user_input, reply):
+def _pass2_worker(user_input, reply, execute_actions=True):
     extracted = _extract_actions(user_input, reply)
-    # 👈 入库前清洗：拦掉大白的话、模型的引申和重复记忆
-    extracted["actions"] = _sanitize_memory_actions(extracted["actions"], user_input, reply)
-    if extracted["actions"]:
-        _execute_actions(extracted["actions"])
-        console.action(f"操作 执行 {len(extracted['actions'])} 项")
+    if execute_actions:
+        # 文本兜底：旧路径（ask_baymax）保留完整动作执行
+        extracted["actions"] = _sanitize_memory_actions(extracted["actions"], user_input, reply)
+        if extracted["actions"]:
+            _execute_actions(extracted["actions"])
+            console.action(f"操作 执行 {len(extracted['actions'])} 项")
+    # Agent 路径（execute_actions=False）：动作已由工具通道闭环执行，
+    # Pass 2 只保留情绪提取（双轨制），避免"工具 + 文本兜底"重复入库
     emotion_queue.put(extracted["emotion"])
     # 情绪由状态机层汇报，这里只留调试明细
     console.debug(f"pass2 emotion={extracted['emotion']}")
@@ -511,6 +528,148 @@ def _rewrite_without_list(user_input, bad_reply):
         {"role": "user", "content": instruction},
     ]
     return _call_llm(msgs, temperature=0.5).strip()
+
+
+# ============================================================
+# 工具注册表（Agent 化：模型发指令 → 本地函数执行）
+# ============================================================
+def _tool_set_reminder(event_name, time, date="", action="set"):
+    """设定/取消定时提醒（复用 _normalize_time + resolve_relative_date + memory.save_reminder）"""
+    t = _normalize_time(time)
+    if not t:
+        return {"ok": False, "msg": f"时间解析失败：{time}"}
+    if action == "cancel":
+        memory.cancel_reminder(event_name)
+        console.action(f"定时提醒 已取消：{event_name}")
+        return {"ok": True, "msg": f"已取消提醒：{event_name}"}
+    if date:
+        d = resolve_relative_date(date)
+        if d:
+            memory.save_reminder(event_name, t, frequency="once", date=d)
+            console.action(f"定时提醒 已设定：{event_name} {t}（{d}）")
+            return {"ok": True, "msg": f"已设定 {d} {t} 提醒：{event_name}"}
+    memory.save_reminder(event_name, t, "daily")
+    console.action(f"定时提醒 已设定：{event_name} {t}")
+    return {"ok": True, "msg": f"已设定每日 {t} 提醒：{event_name}"}
+
+
+def _tool_save_memory(content, source="user_auto"):
+    """保存记忆（复用 _save_memory_from_content：个人信息同步 + 记忆点写入）"""
+    content = str(content).strip()
+    if not content:
+        return {"ok": False, "msg": "记忆内容为空"}
+    try:
+        _save_memory_from_content(content, source=source)
+        return {"ok": True, "msg": f"已保存记忆（来源：{source}）"}
+    except Exception as e:
+        return {"ok": False, "msg": f"保存失败：{e}"}
+
+
+def _tool_search_knowledge(question):
+    """检索医疗知识库（模型自主决定何时需要专业知识）"""
+    hits = search_knowledge_base(str(question), top_k=2)
+    if not hits:
+        return {"ok": True, "msg": "未检索到相关知识", "results": []}
+    return {"ok": True, "msg": f"命中 {len(hits)} 条", "results": hits}
+
+
+TOOL_REGISTRY = {
+    "save_memory": _tool_save_memory,
+    "set_reminder": _tool_set_reminder,
+    "search_knowledge": _tool_search_knowledge,
+}
+
+
+def ask_baymax_with_tools(user_input, wait_pass2=False, on_chunk=None):
+    """
+    Agent 化主入口（路线 A：原生 function calling）：
+      1. 人设 + 资料上下文（不再无条件注入医疗知识）+ few-shot/历史 + 当前输入
+      2. 模型自主决策：返回 tool_calls → 执行 TOOL_REGISTRY 本地函数 → 结果回填
+      3. 循环至模型出人话 → 格式守卫 → 分块流式输出
+      4. 保存历史 + 启动 Pass 2（双轨制情绪 + 文本兜底）
+    与 ask_baymax 并存：ask_baymax 供摘要/测试/兼容，聊天主路径走本函数。
+    """
+    global _messages
+    if not user_input or not user_input.strip():
+        return {"reply": "（等待输入）", "emotion": None}
+
+    msgs = [
+        SystemMessage(content=_build_persona_prompt()),
+        SystemMessage(content=_build_data_context(user_input, include_medical=False)),
+    ]
+    for m in _messages:
+        msgs.append(HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"]))
+    msgs.append(HumanMessage(content=user_input))
+
+    agent_llm = llm.bind_tools(TOOLS)
+    tool_msgs = []
+    final_reply = None
+    for _ in range(5):  # 最多 5 轮工具调用，防死循环
+        try:
+            resp = agent_llm.invoke(msgs + tool_msgs)
+        except Exception as e:
+            console.error(f"Agent 调用失败：{e}")
+            return {"reply": f"大白卡住了... {e}", "emotion": "neutral"}
+
+        if not getattr(resp, "tool_calls", None):
+            final_reply = (resp.content or "（沉默）").strip()
+            break
+
+        tool_msgs.append(resp)
+        for tc in resp.tool_calls:
+            name = tc.get("name", "")
+            args = tc.get("args", {}) or {}
+            fn = TOOL_REGISTRY.get(name)
+            if not fn:
+                result = {"ok": False, "msg": f"未知工具：{name}"}
+            else:
+                try:
+                    result = fn(**args)
+                except Exception as e:
+                    result = {"ok": False, "msg": str(e)}
+            console.debug(f"[工具调用] {name}({json.dumps(args, ensure_ascii=False)}) → {json.dumps(result, ensure_ascii=False)[:80]}")
+            tool_msgs.append(ToolMessage(content=json.dumps(result, ensure_ascii=False), tool_call_id=tc.get("id", "")))
+
+    if final_reply is None:
+        final_reply = "这件事有点复杂，我们慢慢来。"
+
+    # 格式守卫：导师腔兜底（与 ask_baymax 一致）
+    violation = _find_format_violation(final_reply)
+    if violation:
+        try:
+            rewritten = _rewrite_without_list(user_input, final_reply)
+            if rewritten and len(rewritten) >= 20 and not _find_format_violation(rewritten):
+                final_reply = rewritten
+                console.debug(f"[格式守卫] 命中「{violation}」，已重写")
+        except Exception as e:
+            console.debug(f"[格式守卫] 重写失败，保留原版：{e}")
+
+    if on_chunk:
+        for i in range(0, len(final_reply), 6):
+            on_chunk(final_reply[i:i + 6])
+
+    # 保存历史 + 异步 Pass 2（情绪双轨制 + 文本动作兜底）
+    _messages.append({"role": "user", "content": user_input})
+    _messages.append({"role": "assistant", "content": final_reply})
+    memory.save_chat("user", user_input)
+    memory.save_chat("assistant", final_reply)
+    _trim_messages()
+
+    t = threading.Thread(target=_pass2_worker, args=(user_input, final_reply, False))
+    t.start()
+    _PASS2_THREADS.append(t)
+
+    if wait_pass2:
+        if on_chunk:
+            print()
+        t.join()
+        emotion = "neutral"
+        while not emotion_queue.empty():
+            emotion = emotion_queue.get()
+    else:
+        emotion = None
+
+    return {"reply": final_reply, "emotion": emotion}
 
 
 # ============================================================
@@ -698,6 +857,36 @@ def backfill_name_from_profile():
                 return
     except Exception as e:
         console.error(f"名字回填失败：{e}")
+
+
+def ask_care_advice(kind, on_chunk=None):
+    """传感异常关怀（S5 关心状态主流程）：
+    大白主动询问 + 结合最近记忆/RAG 健康知识/Agent 工具，给出完整关怀与建议。
+    kind: "fall" 摔倒 | "heart" 心率偏高
+    """
+    label = {"fall": "摔倒了", "heart": "心率偏高了"}.get(kind, "身体出现了异常")
+    hints = ""
+    try:
+        kws = (["摔倒", "跌倒", "骨折", "扭伤"] if kind == "fall"
+               else ["心率", "高血压", "心悸", "胸痛"])
+        seen = set()
+        for kw in kws:
+            for r in memory.search_all_for_rag(kw, limit=2):
+                c = r.get("content", "")
+                if c and c not in seen:
+                    seen.add(c)
+                    hints += c[:220] + "\n"
+    except Exception as e:
+        console.debug(f"关怀知识检索失败：{e}")
+    care_text = (
+        f"【传感异常关怀任务】我刚检测到用户{label}（传感器模拟触发）。"
+        "你现在是用户的私人健康助理，请："
+        "① 先主动询问用户现在哪里不舒服、有没有受伤；"
+        "② 结合下面检索到的健康知识，告诉用户当下该怎么做（先做什么、注意什么、什么情况必须就医）；"
+        "③ 语气温柔、简短、不吓人，像大白一样。\n"
+        f"检索到的相关健康知识：\n{hints}"
+    )
+    return ask_baymax_with_tools(care_text, wait_pass2=False, on_chunk=on_chunk)
 
 
 def wait_pending_pass2():

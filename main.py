@@ -80,6 +80,11 @@ def _consume_action_queues():
             if _current_reminder:
                 _say_reminder(_current_reminder)
 
+        elif atype == "CARE_FLOW_DONE":
+            # 关怀建议说完 → 转聊天等用户回答（继续关怀对话；已离开关心状态则忽略）
+            if fsm.state == State.CARE:
+                fsm.handle_event("CARE_FLOW_DONE")
+
 
 def get_user_input_console():
     print("\n" + "─" * 46 + "\n💬 大白已准备好倾听，回车发送")
@@ -116,9 +121,11 @@ def main():
                 elif event.key == pygame.K_w or event.key == pygame.K_1:
                     fsm.handle_event("WAKE_USER")
                 elif event.key == pygame.K_f:
-                    fsm.handle_event("WAKE_SENSOR" if fsm.state == State.SLEEP else "SENSOR_ALERT")
+                    fsm.handle_event("WAKE_SENSOR" if fsm.state == State.SLEEP else "SENSOR_ALERT",
+                                     payload={"kind": "fall"})
                 elif event.key == pygame.K_h:
-                    fsm.handle_event("WAKE_SENSOR" if fsm.state == State.SLEEP else "SENSOR_ALERT")
+                    fsm.handle_event("WAKE_SENSOR" if fsm.state == State.SLEEP else "SENSOR_ALERT",
+                                     payload={"kind": "heart"})
                 elif event.key == pygame.K_t:
                     fsm.handle_event("WAKE_TIMER" if fsm.state == State.SLEEP else "TIMER_ALERT")
                 elif event.key == pygame.K_SPACE:
