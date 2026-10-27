@@ -1,15 +1,29 @@
-# 忽略包含 API Key 的配置文件
+# 敏感配置与密钥（绝不提交）
 config.py
+*.key
 
-# 忽略数据库文件
-data/*.db
+# 数据库与运行时数据
+data/
+*.db
+*.db-journal
 
-# 忽略 Python 缓存
+# Python 缓存
 __pycache__/
 *.pyc
+*.pyo
 
-# 忽略虚拟环境
+# 虚拟环境
 .venv/
 venv/
-# 忽略本地源码备份目录
+
+# 本地源码备份（不入库）
 _backup_*/
+_archive/
+
+# IDE 配置
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+docs/技术栈知识地图.md

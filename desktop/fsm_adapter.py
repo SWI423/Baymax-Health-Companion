@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from core import brain, memory, console
 from core.state_machine import BaymaxFSM, State
 from config import (
@@ -26,6 +26,16 @@ TICK_MS = 100
 
 
 class FsmAdapter(QObject):
+    """FSM 适配器（主线程 QTimer 驱动）
+    线程安全规则：LLM/Pass2/调度器/摘要等都在子线程，任何 UI 输出一律通过
+    pyqtSignal 跨线程投递 → 槽在主线程执行，绝不子线程直接碰 Qt 控件。
+    """
+    _sig_line = pyqtSignal(str)          # 完整一行口播
+    _sig_bot_start = pyqtSignal()        # 流式开始
+    _sig_chunk = pyqtSignal(str)         # 流式 token
+    _sig_chat_done = pyqtSignal(str, str)  # (reply, emotion) 回合结束
+    _sig_reminder = pyqtSignal(dict)     # 定时提醒到点（scheduler 线程 → 主线程处理）
+
     def __init__(self, pet, panel, bubble, parent=None):
         super().__init__(parent)
         self.pet = pet
@@ -38,20 +48,26 @@ class FsmAdapter(QObject):
         self._mem_snapshot = self._count_memory()
         self._rmd_snapshot = self._count_reminders()
 
-        # 输出通道：状态机 → UI（回调全部在主线程执行，QTimer 保证；聊天流式在
-        # 子线程发信号，Qt 自动排队到主线程）。大白一开口 → 面板自动弹出+切聊天页。
+        # 信号 → 主线程槽（子线程只 emit，Qt 自动排队）
+        self._sig_line.connect(self._ui_show_line)
+        self._sig_bot_start.connect(self._ui_bot_start)
+        self._sig_chunk.connect(self._ui_chunk)
+        self._sig_chat_done.connect(self._ui_chat_done)
+        self._sig_reminder.connect(self._handle_reminder_due)
+
+        # 输出通道：状态机 → 信号（任何线程调用都安全）
         self.fsm = BaymaxFSM(
-            on_output=self._show_line,
-            on_bot_start=self._bot_start,
-            on_chunk=self._chunk,
-            on_chat_done=self._on_chat_done,
+            on_output=self._sig_line.emit,
+            on_bot_start=self._sig_bot_start.emit,
+            on_chunk=self._sig_chunk.emit,
+            on_chat_done=self._sig_chat_done.emit,
         )
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.tick)
         self._timer.start(TICK_MS)
 
-    # ---------- 状态区/输出 ----------
+    # ---------- 状态区/输出（以下全部主线程执行） ----------
     def _ensure_panel(self):
         """大白说话 → 面板自动弹出（未显示时按大头四边选位置）并切到聊天页"""
         if not self.panel.isVisible():
@@ -60,21 +76,21 @@ class FsmAdapter(QObject):
             self.panel.nav.setCurrentRow(0)
             self.panel.pages.setCurrentIndex(0)
 
-    def _show_line(self, text):
+    def _ui_show_line(self, text):
         if text:
             self._ensure_panel()
             self.panel.chat_page.append_bot_line(text)
 
-    def _bot_start(self):
+    def _ui_bot_start(self):
         self._ensure_panel()
         self.panel.chat_page.append_bot_start()
 
-    def _chunk(self, chunk):
+    def _ui_chunk(self, chunk):
         if chunk:
             self._ensure_panel()
         self.panel.chat_page.append_bot_chunk(chunk)
 
-    def _on_chat_done(self, reply, emotion):
+    def _ui_chat_done(self, reply, emotion):
         self.panel.chat_page.finish_round(reply, emotion)
         self._sync_status_after_chat()
 
@@ -122,7 +138,11 @@ class FsmAdapter(QObject):
             self.fsm.handle_event("WAKE_USER")
 
     def reminder_due(self, reminder):
-        """scheduler 线程 → 仅记录+投事件（主循环处理）"""
+        """scheduler 线程 → 只 emit 信号，由主线程统一处理（状态机只在主线程被操作）"""
+        self._sig_reminder.emit(reminder)
+
+    def _handle_reminder_due(self, reminder):
+        """主线程：定时提醒触发 → 状态机事件（唤醒/提醒）"""
         self._current_reminder = reminder
         event = "WAKE_TIMER" if self.fsm.state == State.SLEEP else "TIMER_ALERT"
         console.action(f"定时提醒 触发：{reminder['event_name']}")
@@ -168,10 +188,10 @@ class FsmAdapter(QObject):
                     console.debug("理由考察结果到达时提醒上下文已结束，丢弃")
                     continue
                 if act.get("verdict") == "accept":
-                    self._show_line(ACCEPT_REASON_REPLY)
+                    self._ui_show_line(ACCEPT_REASON_REPLY)
                     self.fsm.handle_event("REMIND_CONFIRMED")  # → 回待机
                 else:
-                    self._show_line(REJECT_REASON_REPLY)
+                    self._ui_show_line(REJECT_REASON_REPLY)
                     self.fsm.change_state(State.URGE)          # → 催促+开导
             elif atype == "REPEAT_REMIND":
                 if self._current_reminder:
@@ -184,11 +204,11 @@ class FsmAdapter(QObject):
     def _on_state_entered(self, st):
         if st == State.GREET:
             profile = memory.get_user_profile()
-            self._show_line(build_greeting(profile.get("name") or None))
+            self._ui_show_line(build_greeting(profile.get("name") or None))
         elif st == State.REMIND and self._current_reminder:
             self._say_reminder(self._current_reminder)
         elif st == State.URGE:
-            self._show_line(URGE_REPLY)
+            self._ui_show_line(URGE_REPLY)
         elif st == State.SLEEP:
             self.panel.chat_page.release_input()   # 恢复输入（告别后休眠）
             self._summarize_in_background()
@@ -200,7 +220,7 @@ class FsmAdapter(QObject):
 
     def _say_reminder(self, reminder):
         text = REMIND_REPLY.format(event_name=reminder["event_name"])
-        self._show_line(text)
+        self._ui_show_line(text)
         self.bubble.show_reminder(text, self.pet.frameGeometry())
 
     def _summarize_in_background(self):
